@@ -1,0 +1,83 @@
+{
+  "whitelist_groups": {
+    "type": "template_list",
+    "description": "群聊隔离白名单。在此列表中的群聊，每位成员的对话上下文相互独立。建议关闭 AstrBot 全局 unique_session 设置。",
+    "templates": {
+      "group_config": {
+        "label": "群聊配置",
+        "items": {
+          "group_id": {
+            "type": "string",
+            "description": "群聊 ID",
+            "default": "",
+            "hint": "填写群聊的纯数字ID"
+          },
+          "group_name": {
+            "type": "string",
+            "description": "群聊备注名（可选）",
+            "default": ""
+          },
+          "max_turns": {
+            "type": "int",
+            "description": "每位成员对话最大保留轮数（-1=不限制）",
+            "default": 50,
+            "hint": "相当于 AstrBot 的 max_context_length，一个对话轮次 = 1 user + 1 assistant"
+          },
+          "max_tokens": {
+            "type": "int",
+            "description": "每位成员对话最大 Token 数（0=不限制）",
+            "default": 0,
+            "hint": "0 表示不限制 Token 数。达到限制时将触发压缩策略"
+          },
+          "dequeue_turns": {
+            "type": "int",
+            "description": "超限时一次丢弃的最少轮数",
+            "default": 10,
+            "hint": "相当于 AstrBot 的 dequeue_context_length"
+          },
+          "compression_strategy": {
+            "type": "string",
+            "description": "上下文超限时的处理策略",
+            "default": "truncate_by_turns",
+            "options": [
+              "truncate_by_turns",
+              "llm_compress"
+            ],
+            "hint": "truncate_by_turns = 轮次截断, llm_compress = LLM摘要压缩"
+          },
+          "llm_compress_keep_recent_ratio": {
+            "type": "float",
+            "description": "LLM压缩时保留最近上下文的比例",
+            "default": 0.15,
+            "hint": "范围 0.0-0.3，仅 llm_compress 策略生效。例如 0.15 表示保留最近 15% 的上下文作为精确历史"
+          },
+          "llm_compress_provider_id": {
+            "type": "string",
+            "description": "LLM 压缩专用模型（可选）",
+            "default": "",
+            "hint": "仅在 llm_compress 策略下生效。留空则使用当前群聊的对话模型进行压缩。填写 Provider 的完整 ID",
+            "_special": "select_provider"
+          },
+          "llm_compress_keep_recent_ratio": {
+            "type": "float",
+            "description": "LLM压缩时保留最近上下文的比例",
+            "default": 0.15,
+            "hint": "范围 0.0-0.3，仅 llm_compress 策略生效。例如 0.15 表示保留最近 15% 的上下文作为精确历史"
+          },
+          "llm_compress_instruction": {
+            "type": "text",
+            "description": "LLM压缩提示词（可选，留空使用默认提示词）",
+            "default": "",
+            "hint": "仅 llm_compress 策略生效"
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "enable_debug_log": {
+    "type": "bool",
+    "description": "是否启用调试日志",
+    "default": false
+  }
+}
