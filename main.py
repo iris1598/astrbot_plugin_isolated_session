@@ -207,6 +207,43 @@ class Main(Star):
 
         req.contexts = contexts
 
+    # ── 手动压缩：压缩所有内容 ────────────────────────────────────
+
+    async def _manual_compress_all(
+        self,
+        contexts: list[dict],
+        group_cfg: dict,
+        event: AstrMessageEvent,
+    ) -> list[dict]:
+        """手动压缩全部上下文：所有非 system 消息压缩为摘要或截断至保留轮次"""
+        if not contexts:
+            return contexts
+
+        system_msgs = [m for m in contexts if m.get("role") == "system"]
+        non_system = [m for m in contexts if m.get("role") != "system"]
+
+        if not non_system:
+            return contexts
+
+        strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
+
+        if strategy == "llm_compress":
+            summary = await self._call_llm_summary(non_system, group_cfg, event)
+            if summary:
+                return system_msgs + self._build_summary_pair(summary)
+            # LLM 压缩失败，回退到轮次截断
+            logger.warning(
+                "[IsolatedSession] 手动 LLM 压缩失败，回退到轮次截断"
+            )
+
+        # truncate_by_turns 或回退：仅保留最近 max_turns 轮
+        max_turns = group_cfg.get("max_turns", 50)
+        keep_turns = max(1, max_turns if max_turns > 0 else 10)
+        turns = self._group_into_turns(non_system)
+        recent = turns[-keep_turns:]
+        recent_msgs = [msg for turn in recent for msg in turn]
+        return system_msgs + recent_msgs
+
     # ── LLM 摘要调用（提取公共逻辑）──────────────────────────────
 
     async def _call_llm_summary(
@@ -496,5 +533,69 @@ class Main(Star):
             f"压缩策略: {strategy_label}",
             "",
             "使用 /session_reset 重置此会话",
+            "使用 /session_compress 手动压缩上下文",
         ]
         yield event.plain_result("\n".join(info_lines))
+
+    @filter.command("session_compress")
+    async def cmd_compress(self, event: AstrMessageEvent):
+        """手动压缩当前隔离会话的上下文"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        group_cfg = self._find_group_config(group_id, whitelist)
+        if not group_cfg:
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        user_id = event.get_sender_id()
+        user_umo = self._build_user_umo(event, user_id, group_id)
+        conv_mgr = self.context.conversation_manager
+
+        cid = await conv_mgr.get_curr_conversation_id(user_umo)
+        if not cid:
+            yield event.plain_result("ℹ️ 您当前没有活跃的隔离会话，无需压缩。")
+            return
+
+        conv = await conv_mgr.get_conversation(user_umo, cid)
+        if not conv or not conv.history:
+            yield event.plain_result("ℹ️ 当前会话无历史内容，无需压缩。")
+            return
+
+        contexts = json.loads(conv.history)
+        original_count = len(contexts)
+        original_tokens = self._count_tokens(contexts)
+
+        if original_count == 0:
+            yield event.plain_result("ℹ️ 当前会话无历史内容，无需压缩。")
+            return
+
+        compressed = await self._manual_compress_all(contexts, group_cfg, event)
+
+        # 持久化到数据库
+        await conv_mgr.update_conversation(
+            unified_msg_origin=user_umo,
+            conversation_id=cid,
+            history=compressed,
+        )
+        # 更新内存缓存
+        self._conv_cache[(group_id, user_id)] = cid
+        self._last_active[cid] = time.time()
+
+        new_count = len(compressed)
+        new_tokens = self._count_tokens(compressed)
+        strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
+        strategy_label = {
+            "truncate_by_turns": "轮次截断",
+            "llm_compress": "LLM摘要压缩",
+        }.get(strategy, strategy)
+
+        yield event.plain_result(
+            f"✅ 手动压缩完成\n"
+            f"策略: {strategy_label}\n"
+            f"消息: {original_count} → {new_count}\n"
+            f"Token: {original_tokens} → {new_tokens}"
+        )

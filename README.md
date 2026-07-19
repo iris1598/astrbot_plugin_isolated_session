@@ -49,6 +49,7 @@ data/plugins/astrbot_plugin_isolated_session/
 |------|------|
 | `/session_info` | 查看当前群聊中你的隔离会话状态（轮次、Token 数、策略等） |
 | `/session_reset` | 重置你在当前群聊中的隔离会话上下文 |
+| `/session_compress` | 手动压缩当前隔离会话的上下文。根据配置的压缩策略（`llm_compress` 或 `truncate_by_turns`）压缩所有内容，不受自动触发的轮次/Token 上限限制 |
 
 ## 工作原理
 
