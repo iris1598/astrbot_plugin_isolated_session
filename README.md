@@ -11,6 +11,7 @@
   - `llm_compress` — LLM 摘要压缩，超限时用 LLM 将旧历史压缩为摘要（可指定独立的压缩模型）
 - **自动回退**：LLM 压缩失败时自动降级为轮次截断，不丢上下文
 - **超时保护**：LLM 压缩请求超过 `llm_compress_timeout` 秒未返回时，自动压缩回退为丢弃固定轮次（`dequeue_turns`），手动压缩返回压缩失败——避免压缩卡住导致整个群聊对话被阻塞
+- **存档/读档**：每位成员可随时将当前隔离会话保存为命名存档，之后按名称读档恢复、查看或删除存档，存档持久化在 AstrBot 数据库中，重启不丢失
 - **独立命名空间**：隔离 UMO 使用 `isolated__` 前缀，与 AstrBot 原生 `unique_session` 不冲突
 
 ## 安装
@@ -52,6 +53,12 @@ data/plugins/astrbot_plugin_isolated_session/
 | `/session_info` | 查看当前群聊中你的隔离会话状态（轮次、Token 数、策略等） |
 | `/session_reset` | 重置你在当前群聊中的隔离会话上下文 |
 | `/session_compress` | 手动压缩当前隔离会话的上下文。根据配置的压缩策略（`llm_compress` 或 `truncate_by_turns`）压缩所有内容，不受自动触发的轮次/Token 上限限制 |
+| `/session_save <名称>` | 将当前隔离会话保存为命名存档（同名存档会被覆盖） |
+| `/session_load <名称>` | 载入指定存档，替换当前隔离会话的上下文（当前对话将被覆盖，可先存档备份） |
+| `/session_slots` | 列出你的全部存档（名称、消息数、Token、更新时间） |
+| `/session_slot_delete <名称>` | 删除指定存档 |
+
+> 存档名称仅支持中英文、数字、下划线、短横线，长度 1-20 个字符；以上命令均支持中文别名：`存档`、`读档`、`存档列表`、`删档`。
 
 ## 工作原理
 
@@ -77,4 +84,5 @@ data/plugins/astrbot_plugin_isolated_session/
 - **本插件的轮次/Token 限制在 AstrBot 全局限制之前生效**。如果全局 `max_context_length` 比群聊配置更严，会被全局值二次截断。建议将每群聊的 `max_turns` 设为 ≤ 全局值
 - **LLM 压缩会额外消耗一次 LLM 调用**，请合理设置触发阈值
 - **超时保护机制**：自动压缩（轮次/Token 超限触发）若 LLM 请求超过 `llm_compress_timeout` 秒未返回，将丢弃最旧的 `dequeue_turns` 轮并继续对话，不再等待；手动 `/session_compress` 超时则直接提示压缩失败且不改动历史。建议将超时时间设为低于正常回复超时，避免整个群的对话被卡住
+- **存档说明**：存档使用独立的 `isolated_archive__` 命名空间存储在 AstrBot 数据库中，不会出现在正常会话里；`/session_reset` 只清空当前对话，不影响已保存的存档
 - **插件重载后内存缓存丢失**，但隔离对话数据持久化在数据库中，不影响使用

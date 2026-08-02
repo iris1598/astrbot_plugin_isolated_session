@@ -7,6 +7,7 @@ astrbot_plugin_isolated_session - 群聊会话隔离插件
 
 import asyncio
 import json
+import re
 import time
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -23,6 +24,9 @@ DEFAULT_COMPRESS_INSTRUCTION = (
     "The summary should capture all essential information needed to continue "
     "the conversation coherently."
 )
+
+# ── 存档名称规则：中英文、数字、下划线、短横线，1-20 个字符 ──
+SLOT_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\u4e00-\u9fff]{1,20}$")
 
 # ── 主类 ────────────────────────────────────────────────────────
 
@@ -111,6 +115,14 @@ class Main(Star):
         msg_type = MessageType.GROUP_MESSAGE.value  # "GroupMessage"
         return f"{platform}:{msg_type}:isolated__{user_id}__{group_id}"
 
+    def _build_archive_umo(
+        self, event: AstrMessageEvent, user_id: str, group_id: str
+    ) -> str:
+        """构造存档命名空间 UMO: platform:GroupMessage:isolated_archive__{user_id}__{group_id}"""
+        platform = event.get_platform_name()
+        msg_type = MessageType.GROUP_MESSAGE.value  # "GroupMessage"
+        return f"{platform}:{msg_type}:isolated_archive__{user_id}__{group_id}"
+
     # ── 对话管理 ─────────────────────────────────────────────────
 
     async def _get_or_create_conv(
@@ -148,6 +160,24 @@ class Main(Star):
             f"[IsolatedSession] 新建隔离会话: user={user_id} group={group_id}"
         )
         return conv
+
+    # ── 存档管理 ─────────────────────────────────────────────────
+
+    async def _get_archives(self, archive_umo: str) -> list[Conversation]:
+        """获取某用户在群聊中的所有存档，按更新时间倒序"""
+        conv_mgr = self.context.conversation_manager
+        convs = await conv_mgr.get_conversations(archive_umo)
+        convs.sort(key=lambda c: c.updated_at or 0, reverse=True)
+        return convs
+
+    async def _find_archive(
+        self, archive_umo: str, slot_name: str
+    ) -> Conversation | None:
+        """按存档名称查找存档"""
+        for conv in await self._get_archives(archive_umo):
+            if (conv.title or "") == slot_name:
+                return conv
+        return None
 
     # ── 上下文预截断 / 压缩 ──────────────────────────────────────
 
@@ -618,6 +648,7 @@ class Main(Star):
             "",
             "使用 /session_reset 重置此会话",
             "使用 /session_compress 手动压缩上下文",
+            "使用 /session_save <名称> 存档，/session_load <名称> 读档",
         ]
         yield event.plain_result("\n".join(info_lines))
 
@@ -691,3 +722,219 @@ class Main(Star):
             f"消息: {original_count} → {new_count}\n"
             f"Token: {original_tokens} → {new_tokens}"
         )
+
+    @filter.command("session_save", alias={"存档"})
+    async def cmd_save(self, event: AstrMessageEvent, slot_name: str = ""):
+        """将当前隔离会话保存为命名存档"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        slot_name = slot_name.strip()
+        if not slot_name or not SLOT_NAME_RE.match(slot_name):
+            yield event.plain_result(
+                "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
+                "用法: /session_save <存档名>"
+            )
+            return
+
+        user_id = event.get_sender_id()
+        user_umo = self._build_user_umo(event, user_id, group_id)
+        archive_umo = self._build_archive_umo(event, user_id, group_id)
+        conv_mgr = self.context.conversation_manager
+
+        cid = await conv_mgr.get_curr_conversation_id(user_umo)
+        if not cid:
+            yield event.plain_result("ℹ️ 您当前没有活跃的隔离会话，无需存档。")
+            return
+
+        conv = await conv_mgr.get_conversation(user_umo, cid)
+        if not conv or not conv.history:
+            yield event.plain_result("ℹ️ 当前会话无历史内容，无需存档。")
+            return
+
+        contexts = json.loads(conv.history)
+        if not contexts:
+            yield event.plain_result("ℹ️ 当前会话无历史内容，无需存档。")
+            return
+
+        try:
+            overwritten = False
+            existing = await self._find_archive(archive_umo, slot_name)
+            if existing:
+                await conv_mgr.delete_conversation(archive_umo, existing.cid)
+                overwritten = True
+
+            await conv_mgr.new_conversation(
+                unified_msg_origin=archive_umo,
+                platform_id=event.get_platform_name(),
+                content=contexts,
+                title=slot_name,
+            )
+        except Exception as e:
+            logger.error(f"[IsolatedSession] /session_save 失败: {e}")
+            yield event.plain_result(f"❌ 存档失败: {e}")
+            return
+
+        msg_count = len(contexts)
+        tokens = self._count_tokens(contexts)
+        yield event.plain_result(
+            f"💾 存档成功（{'已覆盖同名存档' if overwritten else '新建存档'}）\n"
+            f"存档名: {slot_name}\n"
+            f"消息: {msg_count} 条\n"
+            f"Token: {tokens}"
+        )
+
+    @filter.command("session_load", alias={"读档"})
+    async def cmd_load(self, event: AstrMessageEvent, slot_name: str = ""):
+        """载入命名存档，替换当前隔离会话上下文"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        slot_name = slot_name.strip()
+        if not slot_name or not SLOT_NAME_RE.match(slot_name):
+            yield event.plain_result(
+                "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
+                "用法: /session_load <存档名>"
+            )
+            return
+
+        user_id = event.get_sender_id()
+        user_umo = self._build_user_umo(event, user_id, group_id)
+        archive_umo = self._build_archive_umo(event, user_id, group_id)
+        conv_mgr = self.context.conversation_manager
+
+        slot = await self._find_archive(archive_umo, slot_name)
+        if not slot:
+            yield event.plain_result(
+                f"❌ 未找到存档「{slot_name}」。可用 /session_slots 查看全部存档。"
+            )
+            return
+
+        archive_history = json.loads(slot.history) if slot.history else []
+        if not archive_history:
+            yield event.plain_result(f"❌ 存档「{slot_name}」内容为空，无法载入。")
+            return
+
+        try:
+            cid = await conv_mgr.get_curr_conversation_id(user_umo)
+            if not cid:
+                # 无活跃会话时先创建新的隔离对话再载入
+                cid = await conv_mgr.new_conversation(
+                    user_umo, event.get_platform_name()
+                )
+            await conv_mgr.update_conversation(
+                unified_msg_origin=user_umo,
+                conversation_id=cid,
+                history=archive_history,
+            )
+            # 更新内存缓存
+            self._conv_cache[(group_id, user_id)] = cid
+            self._last_active[cid] = time.time()
+        except Exception as e:
+            logger.error(f"[IsolatedSession] /session_load 失败: {e}")
+            yield event.plain_result(f"❌ 读档失败: {e}")
+            return
+
+        msg_count = len(archive_history)
+        tokens = self._count_tokens(archive_history)
+        yield event.plain_result(
+            f"📂 读档成功，当前对话已替换为存档内容\n"
+            f"存档名: {slot_name}\n"
+            f"消息: {msg_count} 条\n"
+            f"Token: {tokens}"
+        )
+
+    @filter.command("session_slots", alias={"存档列表"})
+    async def cmd_slots(self, event: AstrMessageEvent):
+        """列出当前用户在群聊中的所有存档"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        user_id = event.get_sender_id()
+        archive_umo = self._build_archive_umo(event, user_id, group_id)
+        slots = await self._get_archives(archive_umo)
+
+        if not slots:
+            yield event.plain_result(
+                "📭 您当前没有任何存档。使用 /session_save <存档名> 保存当前对话。"
+            )
+            return
+
+        lines = ["🗂 您的存档列表:"]
+        for i, conv in enumerate(slots, 1):
+            history = json.loads(conv.history) if conv.history else []
+            ts = conv.updated_at or 0
+            time_str = (
+                time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "未知"
+            )
+            lines.append(
+                f"{i}. {conv.title or '(未命名)'} | "
+                f"{len(history)} 条 | {self._count_tokens(history)} token | {time_str}"
+            )
+        lines.append("")
+        lines.append(
+            "使用 /session_load <存档名> 读档，/session_slot_delete <存档名> 删除存档"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("session_slot_delete", alias={"删档"})
+    async def cmd_slot_delete(self, event: AstrMessageEvent, slot_name: str = ""):
+        """删除指定的命名存档"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        slot_name = slot_name.strip()
+        if not slot_name or not SLOT_NAME_RE.match(slot_name):
+            yield event.plain_result(
+                "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
+                "用法: /session_slot_delete <存档名>"
+            )
+            return
+
+        user_id = event.get_sender_id()
+        archive_umo = self._build_archive_umo(event, user_id, group_id)
+        conv_mgr = self.context.conversation_manager
+
+        slot = await self._find_archive(archive_umo, slot_name)
+        if not slot:
+            yield event.plain_result(
+                f"❌ 未找到存档「{slot_name}」。可用 /session_slots 查看全部存档。"
+            )
+            return
+
+        try:
+            await conv_mgr.delete_conversation(archive_umo, slot.cid)
+        except Exception as e:
+            logger.error(f"[IsolatedSession] /session_slot_delete 失败: {e}")
+            yield event.plain_result(f"❌ 删除存档失败: {e}")
+            return
+
+        yield event.plain_result(f"🗑 已删除存档「{slot_name}」。")
