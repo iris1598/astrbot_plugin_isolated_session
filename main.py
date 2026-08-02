@@ -5,6 +5,7 @@ astrbot_plugin_isolated_session - 群聊会话隔离插件
 支持每群聊配置独立的轮次限制、最大 Token 数及压缩策略。
 """
 
+import asyncio
 import json
 import time
 
@@ -169,6 +170,7 @@ class Main(Star):
         )
 
         # ── 第 1 步：轮次超限 → 按策略处理 ──
+        llm_timed_out = False
         if max_turns > 0:
             system_msgs = [m for m in contexts if m.get("role") == "system"]
             non_system = [m for m in contexts if m.get("role") != "system"]
@@ -181,10 +183,23 @@ class Main(Star):
                     recent = turns[-keep_turn_count:]
                     old = turns[:-keep_turn_count]
                     old_msgs = [msg for turn in old for msg in turn]
-                    summary = await self._call_llm_summary(old_msgs, group_cfg, event)
-                    if summary:
+                    status, summary = await self._call_llm_summary(
+                        old_msgs, group_cfg, event
+                    )
+                    if status == "ok":
                         recent_msgs = [msg for turn in recent for msg in turn]
                         contexts = system_msgs + self._build_summary_pair(summary) + recent_msgs
+                    elif status == "timeout":
+                        # 压缩超时：回退为丢弃固定轮次，避免对话卡住
+                        llm_timed_out = True
+                        excess = len(turns) - max_turns
+                        contexts = self._discard_old_turns(
+                            contexts,
+                            max(self._get_dequeue_turns(group_cfg), excess),
+                        )
+                        logger.warning(
+                            "[IsolatedSession] LLM 压缩超时，已回退为丢弃固定轮次"
+                        )
                     else:
                         # 压缩失败，回退到按轮次截断
                         turns = turns[-max_turns:]
@@ -198,10 +213,18 @@ class Main(Star):
 
         # ── 第 2 步：Token 超限 → 按策略处理 ──
         if max_tokens > 0 and self._count_tokens(contexts) > max_tokens:
-            if strategy == "llm_compress":
+            if strategy == "llm_compress" and not llm_timed_out:
                 if self.config.get("enable_debug_log"):
                     logger.debug("[IsolatedSession] Token 超限，触发 LLM 上下文压缩")
                 contexts = await self._llm_compress(contexts, max_tokens, group_cfg, event)
+            elif strategy == "llm_compress":
+                # 本轮请求压缩已超时，避免再次等待 LLM，直接回退为丢弃固定轮次
+                logger.warning(
+                    "[IsolatedSession] 压缩已超时，Token 超限回退为丢弃固定轮次"
+                )
+                contexts = self._discard_old_turns(
+                    contexts, self._get_dequeue_turns(group_cfg)
+                )
             else:
                 contexts = self._truncate_by_tokens_full(contexts, max_tokens)
 
@@ -214,23 +237,36 @@ class Main(Star):
         contexts: list[dict],
         group_cfg: dict,
         event: AstrMessageEvent,
-    ) -> list[dict]:
-        """手动压缩全部上下文：所有非 system 消息压缩为摘要或截断至保留轮次"""
+    ) -> tuple[list[dict], str]:
+        """手动压缩全部上下文：所有非 system 消息压缩为摘要或截断至保留轮次。
+
+        返回 (压缩结果, 状态)，状态取值：
+        - "ok": 压缩成功（含 LLM 成功或回退到轮次截断）
+        - "timeout": LLM 压缩超时，上下文未修改，由调用方报告压缩失败
+        """
         if not contexts:
-            return contexts
+            return contexts, "ok"
 
         system_msgs = [m for m in contexts if m.get("role") == "system"]
         non_system = [m for m in contexts if m.get("role") != "system"]
 
         if not non_system:
-            return contexts
+            return contexts, "ok"
 
         strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
 
         if strategy == "llm_compress":
-            summary = await self._call_llm_summary(non_system, group_cfg, event)
-            if summary:
-                return system_msgs + self._build_summary_pair(summary)
+            status, summary = await self._call_llm_summary(
+                non_system, group_cfg, event
+            )
+            if status == "ok":
+                return system_msgs + self._build_summary_pair(summary), "ok"
+            if status == "timeout":
+                # 手动压缩超时：返回压缩失败，不修改上下文
+                logger.warning(
+                    "[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败"
+                )
+                return contexts, "timeout"
             # LLM 压缩失败，回退到轮次截断
             logger.warning(
                 "[IsolatedSession] 手动 LLM 压缩失败，回退到轮次截断"
@@ -242,7 +278,7 @@ class Main(Star):
         turns = self._group_into_turns(non_system)
         recent = turns[-keep_turns:]
         recent_msgs = [msg for turn in recent for msg in turn]
-        return system_msgs + recent_msgs
+        return system_msgs + recent_msgs, "ok"
 
     # ── LLM 摘要调用（提取公共逻辑）──────────────────────────────
 
@@ -251,8 +287,14 @@ class Main(Star):
         old_msgs: list[dict],
         group_cfg: dict,
         event: AstrMessageEvent,
-    ) -> str | None:
-        """调用 LLM 生成历史对话摘要，失败返回 None"""
+    ) -> tuple[str, str | None]:
+        """调用 LLM 生成历史对话摘要。
+
+        返回 (status, summary)：
+        - ("ok", summary): 压缩成功
+        - ("failed", None): 压缩失败（异常或返回空摘要）
+        - ("timeout", None): 压缩请求超时
+        """
         old_text = self._contexts_to_text(old_msgs)
         instruction = (
             group_cfg.get("llm_compress_instruction") or DEFAULT_COMPRESS_INSTRUCTION
@@ -272,20 +314,31 @@ class Main(Star):
                     f"[IsolatedSession] 未配置压缩模型，使用当前聊天模型: {compress_provider_id}"
                 )
 
+        timeout = float(group_cfg.get("llm_compress_timeout", 30) or 0)
+
         try:
-            llm_resp = await self.context.llm_generate(
+            coro = self.context.llm_generate(
                 chat_provider_id=compress_provider_id,
                 prompt=compress_prompt,
                 session_id=f"isolated_compress_{int(time.time())}",
             )
+            if timeout > 0:
+                llm_resp = await asyncio.wait_for(coro, timeout=timeout)
+            else:
+                llm_resp = await coro
             summary = llm_resp.completion_text.strip() if llm_resp else ""
             if not summary:
                 logger.warning("[IsolatedSession] LLM 压缩返回空摘要")
-                return None
-            return summary
+                return "failed", None
+            return "ok", summary
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.error(
+                f"[IsolatedSession] LLM 压缩请求超时（超过 {timeout} 秒）"
+            )
+            return "timeout", None
         except Exception as e:
             logger.error(f"[IsolatedSession] LLM 压缩失败: {e}")
-            return None
+            return "failed", None
 
     @staticmethod
     def _build_summary_pair(summary: str) -> list[dict]:
@@ -332,8 +385,17 @@ class Main(Star):
             return contexts
 
         old_msgs = [msg for turn in old_turns for msg in turn]
-        summary = await self._call_llm_summary(old_msgs, group_cfg, event)
-        if not summary:
+        status, summary = await self._call_llm_summary(
+            old_msgs, group_cfg, event
+        )
+        if status == "timeout":
+            logger.warning(
+                "[IsolatedSession] LLM 压缩超时，回退为丢弃固定轮次"
+            )
+            return self._discard_old_turns(
+                contexts, self._get_dequeue_turns(group_cfg)
+            )
+        if status != "ok":
             logger.warning("[IsolatedSession] LLM 压缩失败，回退到轮次截断")
             return self._truncate_by_tokens_full(contexts, max_tokens)
 
@@ -399,6 +461,28 @@ class Main(Star):
         if current:
             turns.append(current)
         return turns
+
+    @staticmethod
+    def _get_dequeue_turns(group_cfg: dict) -> int:
+        """获取压缩超时回退时一次丢弃的固定轮次数（至少 1 轮）"""
+        return max(1, int(group_cfg.get("dequeue_turns", 10) or 1))
+
+    def _discard_old_turns(
+        self, contexts: list[dict], discard_turns: int
+    ) -> list[dict]:
+        """丢弃最旧的固定轮次（保留 system 消息），用于压缩超时回退"""
+        system_msgs = [m for m in contexts if m.get("role") == "system"]
+        non_system = [m for m in contexts if m.get("role") != "system"]
+        if not non_system:
+            return contexts
+
+        turns = self._group_into_turns(non_system)
+        drop_count = min(max(1, int(discard_turns)), len(turns) - 1)
+        if drop_count <= 0:
+            return contexts
+
+        remaining = [msg for turn in turns[drop_count:] for msg in turn]
+        return system_msgs + remaining
 
     def _truncate_by_tokens_full(
         self, contexts: list[dict], max_tokens: int
@@ -573,7 +657,15 @@ class Main(Star):
             yield event.plain_result("ℹ️ 当前会话无历史内容，无需压缩。")
             return
 
-        compressed = await self._manual_compress_all(contexts, group_cfg, event)
+        compressed, status = await self._manual_compress_all(
+            contexts, group_cfg, event
+        )
+
+        if status == "timeout":
+            yield event.plain_result(
+                "❌ 手动压缩失败：LLM 压缩请求超时，上下文未修改，请稍后重试。"
+            )
+            return
 
         # 持久化到数据库
         await conv_mgr.update_conversation(

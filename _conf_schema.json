@@ -31,9 +31,9 @@
           },
           "dequeue_turns": {
             "type": "int",
-            "description": "超限时一次丢弃的最少轮数",
+            "description": "超限/LLM压缩超时时一次丢弃的最少轮数",
             "default": 10,
-            "hint": "相当于 AstrBot 的 dequeue_context_length"
+            "hint": "相当于 AstrBot 的 dequeue_context_length。LLM 压缩超时回退时按此轮数丢弃最旧上下文"
           },
           "compression_strategy": {
             "type": "string",
@@ -58,11 +58,11 @@
             "hint": "仅在 llm_compress 策略下生效。留空则使用当前群聊的对话模型进行压缩。填写 Provider 的完整 ID",
             "_special": "select_provider"
           },
-          "llm_compress_keep_recent_ratio": {
-            "type": "float",
-            "description": "LLM压缩时保留最近上下文的比例",
-            "default": 0.15,
-            "hint": "范围 0.0-0.3，仅 llm_compress 策略生效。例如 0.15 表示保留最近 15% 的上下文作为精确历史"
+          "llm_compress_timeout": {
+            "type": "int",
+            "description": "LLM 压缩请求超时时间（秒），0=不限制",
+            "default": 30,
+            "hint": "仅 llm_compress 策略生效。自动压缩超时回退为丢弃固定轮次（dequeue_turns），避免对话卡住；手动压缩超时返回压缩失败。建议 10-60"
           },
           "llm_compress_instruction": {
             "type": "text",

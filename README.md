@@ -10,6 +10,7 @@
   - `truncate_by_turns` — 轮次截断，超限时直接丢弃旧轮次
   - `llm_compress` — LLM 摘要压缩，超限时用 LLM 将旧历史压缩为摘要（可指定独立的压缩模型）
 - **自动回退**：LLM 压缩失败时自动降级为轮次截断，不丢上下文
+- **超时保护**：LLM 压缩请求超过 `llm_compress_timeout` 秒未返回时，自动压缩回退为丢弃固定轮次（`dequeue_turns`），手动压缩返回压缩失败——避免压缩卡住导致整个群聊对话被阻塞
 - **独立命名空间**：隔离 UMO 使用 `isolated__` 前缀，与 AstrBot 原生 `unique_session` 不冲突
 
 ## 安装
@@ -37,9 +38,10 @@ data/plugins/astrbot_plugin_isolated_session/
 | `group_name` | string | - | 备注名（可选） |
 | `max_turns` | int | 50 | 最大保留轮次，-1=不限制 |
 | `max_tokens` | int | 0 | 最大 Token 数，0=不限制 |
-| `dequeue_turns` | int | 10 | 超限时每次丢弃的最少轮数 |
+| `dequeue_turns` | int | 10 | 超限时每次丢弃的最少轮数；LLM 压缩超时回退时按此丢弃最旧轮次 |
 | `compression_strategy` | string | `truncate_by_turns` | `truncate_by_turns` 或 `llm_compress` |
 | `llm_compress_provider_id` | string | 空 | LLM 压缩专用模型（留空使用当前对话模型） |
+| `llm_compress_timeout` | int | 30 | LLM 压缩请求超时时间（秒），0=不限制 |
 | `llm_compress_keep_recent_ratio` | float | 0.15 | LLM 压缩时保留最近上下文比例 (0.0-0.3) |
 | `llm_compress_instruction` | text | 空 | 自定义压缩提示词（留空使用默认） |
 
@@ -74,4 +76,5 @@ data/plugins/astrbot_plugin_isolated_session/
 - **建议关闭 AstrBot 全局 `unique_session`**。两者同时开启不冲突（使用独立命名空间），但可能造成混淆
 - **本插件的轮次/Token 限制在 AstrBot 全局限制之前生效**。如果全局 `max_context_length` 比群聊配置更严，会被全局值二次截断。建议将每群聊的 `max_turns` 设为 ≤ 全局值
 - **LLM 压缩会额外消耗一次 LLM 调用**，请合理设置触发阈值
+- **超时保护机制**：自动压缩（轮次/Token 超限触发）若 LLM 请求超过 `llm_compress_timeout` 秒未返回，将丢弃最旧的 `dequeue_turns` 轮并继续对话，不再等待；手动 `/session_compress` 超时则直接提示压缩失败且不改动历史。建议将超时时间设为低于正常回复超时，避免整个群的对话被卡住
 - **插件重载后内存缓存丢失**，但隔离对话数据持久化在数据库中，不影响使用
