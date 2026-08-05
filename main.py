@@ -260,18 +260,22 @@ class Main(Star):
 
         req.contexts = contexts
 
-    # ── 手动压缩：压缩所有内容 ────────────────────────────────────
+    # ── 手动压缩：保留最近 N 条，其余压缩 ─────────────────────────
 
     async def _manual_compress_all(
         self,
         contexts: list[dict],
         group_cfg: dict,
         event: AstrMessageEvent,
+        keep_count: int = 5,
     ) -> tuple[list[dict], str]:
-        """手动压缩全部上下文：所有非 system 消息压缩为摘要或截断至保留轮次。
+        """手动压缩上下文：保留最近 keep_count 条非 system 消息，其余压缩或丢弃。
+
+        keep_count=0 表示全部压缩，不保留任何非 system 消息；
+        keep_count 大于等于非 system 消息总数时无可压缩内容，原样返回。
 
         返回 (压缩结果, 状态)，状态取值：
-        - "ok": 压缩成功（含 LLM 成功或回退到轮次截断）
+        - "ok": 压缩成功（含 LLM 成功或回退到直接丢弃旧消息）
         - "timeout": LLM 压缩超时，上下文未修改，由调用方报告压缩失败
         """
         if not contexts:
@@ -283,31 +287,41 @@ class Main(Star):
         if not non_system:
             return contexts, "ok"
 
+        keep_count = max(0, int(keep_count))
+        if keep_count >= len(non_system):
+            # 需要保留的条数 >= 现有消息数，没有旧消息可压缩
+            return contexts, "ok"
+
+        if keep_count > 0:
+            old_msgs = non_system[:-keep_count]
+            recent_msgs = non_system[-keep_count:]
+        else:
+            old_msgs = non_system
+            recent_msgs = []
+
         strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
 
         if strategy == "llm_compress":
             status, summary = await self._call_llm_summary(
-                non_system, group_cfg, event
+                old_msgs, group_cfg, event
             )
             if status == "ok":
-                return system_msgs + self._build_summary_pair(summary), "ok"
+                return (
+                    system_msgs + self._build_summary_pair(summary) + recent_msgs,
+                    "ok",
+                )
             if status == "timeout":
                 # 手动压缩超时：返回压缩失败，不修改上下文
                 logger.warning(
                     "[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败"
                 )
                 return contexts, "timeout"
-            # LLM 压缩失败，回退到轮次截断
+            # LLM 压缩失败，回退为直接丢弃旧消息
             logger.warning(
-                "[IsolatedSession] 手动 LLM 压缩失败，回退到轮次截断"
+                "[IsolatedSession] 手动 LLM 压缩失败，回退为直接丢弃旧消息"
             )
 
-        # truncate_by_turns 或回退：仅保留最近 max_turns 轮
-        max_turns = group_cfg.get("max_turns", 50)
-        keep_turns = max(1, max_turns if max_turns > 0 else 10)
-        turns = self._group_into_turns(non_system)
-        recent = turns[-keep_turns:]
-        recent_msgs = [msg for turn in recent for msg in turn]
+        # truncate_by_turns 或回退：仅保留最近 keep_count 条消息
         return system_msgs + recent_msgs, "ok"
 
     # ── LLM 摘要调用（提取公共逻辑）──────────────────────────────
@@ -647,14 +661,14 @@ class Main(Star):
             f"压缩策略: {strategy_label}",
             "",
             "使用 /session_reset 重置此会话",
-            "使用 /session_compress 手动压缩上下文",
+            "使用 /session_compress [保留条数] 手动压缩上下文（默认保留 5 条，0=全部压缩）",
             "使用 /session_save <名称> 存档，/session_load <名称> 读档",
         ]
         yield event.plain_result("\n".join(info_lines))
 
     @filter.command("session_compress")
-    async def cmd_compress(self, event: AstrMessageEvent):
-        """手动压缩当前隔离会话的上下文"""
+    async def cmd_compress(self, event: AstrMessageEvent, keep_count: int = 5):
+        """手动压缩当前隔离会话的上下文，可指定保留最近多少条消息（默认 5，0=全部压缩）"""
         if not event.message_obj.group_id:
             yield event.plain_result("❌ 此命令仅在群聊中可用。")
             return
@@ -664,6 +678,14 @@ class Main(Star):
         group_cfg = self._find_group_config(group_id, whitelist)
         if not group_cfg:
             yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        if keep_count < 0:
+            yield event.plain_result(
+                "❌ 保留条数不能为负数。\n"
+                "用法: /session_compress [保留条数]\n"
+                "不填默认保留 5 条最近消息，填 0 表示全部压缩。"
+            )
             return
 
         user_id = event.get_sender_id()
@@ -689,12 +711,19 @@ class Main(Star):
             return
 
         compressed, status = await self._manual_compress_all(
-            contexts, group_cfg, event
+            contexts, group_cfg, event, keep_count
         )
 
         if status == "timeout":
             yield event.plain_result(
                 "❌ 手动压缩失败：LLM 压缩请求超时，上下文未修改，请稍后重试。"
+            )
+            return
+
+        if compressed == contexts:
+            yield event.plain_result(
+                f"ℹ️ 当前会话最近 {keep_count} 条消息以内的内容无需压缩，未做修改。\n"
+                f"消息: {original_count} 条 | Token: {original_tokens}"
             )
             return
 
@@ -715,10 +744,14 @@ class Main(Star):
             "truncate_by_turns": "轮次截断",
             "llm_compress": "LLM摘要压缩",
         }.get(strategy, strategy)
+        keep_desc = (
+            f"保留最近 {keep_count} 条" if keep_count > 0 else "全部压缩（不保留消息）"
+        )
 
         yield event.plain_result(
             f"✅ 手动压缩完成\n"
             f"策略: {strategy_label}\n"
+            f"{keep_desc}\n"
             f"消息: {original_count} → {new_count}\n"
             f"Token: {original_tokens} → {new_tokens}"
         )

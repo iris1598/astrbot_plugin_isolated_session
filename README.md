@@ -52,7 +52,7 @@ data/plugins/astrbot_plugin_isolated_session/
 |------|------|
 | `/session_info` | 查看当前群聊中你的隔离会话状态（轮次、Token 数、策略等） |
 | `/session_reset` | 重置你在当前群聊中的隔离会话上下文 |
-| `/session_compress` | 手动压缩当前隔离会话的上下文。根据配置的压缩策略（`llm_compress` 或 `truncate_by_turns`）压缩所有内容，不受自动触发的轮次/Token 上限限制 |
+| `/session_compress [保留条数]` | 手动压缩当前隔离会话的上下文。根据配置的压缩策略（`llm_compress` 或 `truncate_by_turns`）压缩旧内容，可选保留最近 N 条消息：不填默认保留 5 条，填 0 表示全部压缩；不受自动触发的轮次/Token 上限限制 |
 | `/session_save <名称>` | 将当前隔离会话保存为命名存档（同名存档会被覆盖） |
 | `/session_load <名称>` | 载入指定存档，替换当前隔离会话的上下文（当前对话将被覆盖，可先存档备份） |
 | `/session_slots` | 列出你的全部存档（名称、消息数、Token、更新时间） |
