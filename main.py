@@ -581,7 +581,7 @@ class Main(Star):
 
     # ── 用户命令 ─────────────────────────────────────────────────
 
-    @filter.command("session_reset")
+    @filter.command("会话重置", alias={"session_reset"})
     async def cmd_reset(self, event: AstrMessageEvent):
         """重置当前用户在当前群聊中的隔离会话"""
         if not event.message_obj.group_id:
@@ -605,10 +605,10 @@ class Main(Star):
                 "✅ 已重置您在此群聊中的对话上下文。下次发言将创建新的独立会话。"
             )
         except Exception as e:
-            logger.error(f"[IsolatedSession] /session_reset 失败: {e}")
+            logger.error(f"[IsolatedSession] /会话重置 失败: {e}")
             yield event.plain_result(f"❌ 重置失败: {e}")
 
-    @filter.command("session_info")
+    @filter.command("会话信息", alias={"session_info"})
     async def cmd_info(self, event: AstrMessageEvent):
         """查看当前隔离会话信息"""
         if not event.message_obj.group_id:
@@ -660,13 +660,13 @@ class Main(Star):
             f"最大Token: {'无限制' if max_tokens <= 0 else max_tokens}",
             f"压缩策略: {strategy_label}",
             "",
-            "使用 /session_reset 重置此会话",
-            "使用 /session_compress [保留条数] 手动压缩上下文（默认保留 5 条，0=全部压缩）",
-            "使用 /session_save <名称> 存档，/session_load <名称> 读档",
+            "使用 /会话重置 重置此会话",
+            "使用 /会话压缩 [保留条数] 手动压缩上下文（默认保留 5 条，0=全部压缩）",
+            "使用 /存档 <名称> 存档，/读档 <名称> 读档",
         ]
         yield event.plain_result("\n".join(info_lines))
 
-    @filter.command("session_compress")
+    @filter.command("会话压缩", alias={"session_compress"})
     async def cmd_compress(self, event: AstrMessageEvent, keep_count: int = 5):
         """手动压缩当前隔离会话的上下文，可指定保留最近多少条消息（默认 5，0=全部压缩）"""
         if not event.message_obj.group_id:
@@ -683,7 +683,7 @@ class Main(Star):
         if keep_count < 0:
             yield event.plain_result(
                 "❌ 保留条数不能为负数。\n"
-                "用法: /session_compress [保留条数]\n"
+                "用法: /会话压缩 [保留条数]\n"
                 "不填默认保留 5 条最近消息，填 0 表示全部压缩。"
             )
             return
@@ -756,7 +756,7 @@ class Main(Star):
             f"Token: {original_tokens} → {new_tokens}"
         )
 
-    @filter.command("session_save", alias={"存档"})
+    @filter.command("存档", alias={"session_save"})
     async def cmd_save(self, event: AstrMessageEvent, slot_name: str = ""):
         """将当前隔离会话保存为命名存档"""
         if not event.message_obj.group_id:
@@ -773,7 +773,7 @@ class Main(Star):
         if not slot_name or not SLOT_NAME_RE.match(slot_name):
             yield event.plain_result(
                 "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
-                "用法: /session_save <存档名>"
+                "用法: /存档 <存档名>"
             )
             return
 
@@ -811,7 +811,7 @@ class Main(Star):
                 title=slot_name,
             )
         except Exception as e:
-            logger.error(f"[IsolatedSession] /session_save 失败: {e}")
+            logger.error(f"[IsolatedSession] /存档 失败: {e}")
             yield event.plain_result(f"❌ 存档失败: {e}")
             return
 
@@ -824,7 +824,7 @@ class Main(Star):
             f"Token: {tokens}"
         )
 
-    @filter.command("session_load", alias={"读档"})
+    @filter.command("读档", alias={"session_load"})
     async def cmd_load(self, event: AstrMessageEvent, slot_name: str = ""):
         """载入命名存档，替换当前隔离会话上下文"""
         if not event.message_obj.group_id:
@@ -841,7 +841,7 @@ class Main(Star):
         if not slot_name or not SLOT_NAME_RE.match(slot_name):
             yield event.plain_result(
                 "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
-                "用法: /session_load <存档名>"
+                "用法: /读档 <存档名>"
             )
             return
 
@@ -853,7 +853,7 @@ class Main(Star):
         slot = await self._find_archive(archive_umo, slot_name)
         if not slot:
             yield event.plain_result(
-                f"❌ 未找到存档「{slot_name}」。可用 /session_slots 查看全部存档。"
+                f"❌ 未找到存档「{slot_name}」。可用 /存档列表 查看全部存档。"
             )
             return
 
@@ -878,7 +878,7 @@ class Main(Star):
             self._conv_cache[(group_id, user_id)] = cid
             self._last_active[cid] = time.time()
         except Exception as e:
-            logger.error(f"[IsolatedSession] /session_load 失败: {e}")
+            logger.error(f"[IsolatedSession] /读档 失败: {e}")
             yield event.plain_result(f"❌ 读档失败: {e}")
             return
 
@@ -891,7 +891,7 @@ class Main(Star):
             f"Token: {tokens}"
         )
 
-    @filter.command("session_slots", alias={"存档列表"})
+    @filter.command("存档列表", alias={"session_slots"})
     async def cmd_slots(self, event: AstrMessageEvent):
         """列出当前用户在群聊中的所有存档"""
         if not event.message_obj.group_id:
@@ -910,7 +910,7 @@ class Main(Star):
 
         if not slots:
             yield event.plain_result(
-                "📭 您当前没有任何存档。使用 /session_save <存档名> 保存当前对话。"
+                "📭 您当前没有任何存档。使用 /存档 <存档名> 保存当前对话。"
             )
             return
 
@@ -927,11 +927,11 @@ class Main(Star):
             )
         lines.append("")
         lines.append(
-            "使用 /session_load <存档名> 读档，/session_slot_delete <存档名> 删除存档"
+            "使用 /读档 <存档名> 读档，/删档 <存档名> 删除存档"
         )
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("session_slot_delete", alias={"删档"})
+    @filter.command("删档", alias={"session_slot_delete"})
     async def cmd_slot_delete(self, event: AstrMessageEvent, slot_name: str = ""):
         """删除指定的命名存档"""
         if not event.message_obj.group_id:
@@ -948,7 +948,7 @@ class Main(Star):
         if not slot_name or not SLOT_NAME_RE.match(slot_name):
             yield event.plain_result(
                 "❌ 存档名称只能包含中英文、数字、下划线或短横线，且不超过 20 个字符。\n"
-                "用法: /session_slot_delete <存档名>"
+                "用法: /删档 <存档名>"
             )
             return
 
@@ -959,14 +959,14 @@ class Main(Star):
         slot = await self._find_archive(archive_umo, slot_name)
         if not slot:
             yield event.plain_result(
-                f"❌ 未找到存档「{slot_name}」。可用 /session_slots 查看全部存档。"
+                f"❌ 未找到存档「{slot_name}」。可用 /存档列表 查看全部存档。"
             )
             return
 
         try:
             await conv_mgr.delete_conversation(archive_umo, slot.cid)
         except Exception as e:
-            logger.error(f"[IsolatedSession] /session_slot_delete 失败: {e}")
+            logger.error(f"[IsolatedSession] /删档 失败: {e}")
             yield event.plain_result(f"❌ 删除存档失败: {e}")
             return
 
