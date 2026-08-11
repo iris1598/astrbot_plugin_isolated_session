@@ -275,8 +275,9 @@ class Main(Star):
         keep_count 大于等于非 system 消息总数时无可压缩内容，原样返回。
 
         返回 (压缩结果, 状态)，状态取值：
-        - "ok": 压缩成功（含 LLM 成功或回退到直接丢弃旧消息）
+        - "ok": 压缩成功（含 LLM 成功或轮次截断）
         - "timeout": LLM 压缩超时，上下文未修改，由调用方报告压缩失败
+        - "failed": LLM 压缩失败，上下文未修改，由调用方报告压缩失败
         """
         if not contexts:
             return contexts, "ok"
@@ -316,12 +317,13 @@ class Main(Star):
                     "[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败"
                 )
                 return contexts, "timeout"
-            # LLM 压缩失败，回退为直接丢弃旧消息
+            # LLM 压缩失败：返回压缩失败，不修改上下文
             logger.warning(
-                "[IsolatedSession] 手动 LLM 压缩失败，回退为直接丢弃旧消息"
+                "[IsolatedSession] 手动 LLM 压缩失败，返回压缩失败，上下文未修改"
             )
+            return contexts, "failed"
 
-        # truncate_by_turns 或回退：仅保留最近 keep_count 条消息
+        # truncate_by_turns：仅保留最近 keep_count 条消息
         return system_msgs + recent_msgs, "ok"
 
     # ── LLM 摘要调用（提取公共逻辑）──────────────────────────────
@@ -717,6 +719,12 @@ class Main(Star):
         if status == "timeout":
             yield event.plain_result(
                 "❌ 手动压缩失败：LLM 压缩请求超时，上下文未修改，请稍后重试。"
+            )
+            return
+
+        if status == "failed":
+            yield event.plain_result(
+                "❌ 手动压缩失败：LLM 压缩请求出错或返回空摘要，上下文未修改，请稍后重试。"
             )
             return
 
