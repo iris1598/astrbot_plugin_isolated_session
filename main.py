@@ -10,12 +10,15 @@ import json
 import re
 import time
 
-from astrbot.api.event import filter, AstrMessageEvent
+from astrbot.api import AstrBotConfig, logger, sp
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.api.provider import ProviderRequest
-from astrbot.api import logger, AstrBotConfig
-from astrbot.core.platform.message_type import MessageType
+from astrbot.core.agent.message import TextPart
 from astrbot.core.db.po import Conversation
+from astrbot.core.platform.message_type import MessageType
+
+from .memory import MemoryManager
 
 # ── 默认 LLM 压缩提示词（与 AstrBot 默认值一致） ──────────────
 DEFAULT_COMPRESS_INSTRUCTION = (
@@ -41,6 +44,12 @@ class Main(Star):
         self._conv_cache: dict[tuple[str, str], str] = {}
         # 末次活跃时间: {conversation_id: timestamp}
         self._last_active: dict[str, float] = {}
+        # 记忆系统（基于共享知识库的随时间衰减记忆）
+        self.memory: MemoryManager | None = None
+        # 后台任务引用集合，防止被垃圾回收
+        self._pending_tasks: set = set()
+        # 待抽取对话缓冲: {owner: [(user_text, reply_text), ...]}（间隔内积累的全部轮次）
+        self._extract_buffers: dict[str, list[tuple[str, str]]] = {}
 
     # ── 初始化 ──────────────────────────────────────────────────
 
@@ -60,9 +69,32 @@ class Main(Star):
             pass  # 非关键，获取配置失败时静默忽略
 
         whitelist = self.config.get("whitelist_groups", [])
-        logger.info(
-            f"[IsolatedSession] 插件已加载，白名单群聊数: {len(whitelist)}"
-        )
+        logger.info(f"[IsolatedSession] 插件已加载，白名单群聊数: {len(whitelist)}")
+
+        # 记忆系统初始化（失败仅禁用记忆，不影响会话隔离等功能）
+        self.memory = None
+        if self._mcfg("memory_enabled", False):
+            try:
+                if getattr(self.context, "kb_manager", None) is None:
+                    logger.warning(
+                        "[IsolatedSession] 记忆功能已启用，但 AstrBot 知识库模块不可用。"
+                    )
+                else:
+                    self.memory = MemoryManager(self.context, self.config)
+                    probe = await self.memory.ensure_kb()
+                    if probe is None:
+                        logger.warning(
+                            "[IsolatedSession] 记忆功能已启用，但共享记忆知识库不可用："
+                            "请在 WebUI 创建知识库（配置 Embedding 模型），"
+                            "并在插件配置的 memory_kb_name 中选择。"
+                        )
+                    else:
+                        logger.info(
+                            f"[IsolatedSession] 记忆系统就绪，共享知识库: {probe.kb.kb_name}"
+                        )
+            except Exception as e:
+                logger.error(f"[IsolatedSession] 记忆系统初始化失败: {e}")
+                self.memory = None
 
     # ── 核心钩子：on_llm_request ─────────────────────────────────
 
@@ -92,18 +124,176 @@ class Main(Star):
 
         # 4. 替换 req.conversation 和 req.contexts
         req.conversation = user_conv
-        req.contexts = (
-            json.loads(user_conv.history) if user_conv.history else []
-        )
+        req.contexts = json.loads(user_conv.history) if user_conv.history else []
 
         # 5. 预截断 / 压缩上下文
         await self._pre_truncate_contexts(req, group_cfg, event)
+
+        # 6. 记忆召回与注入（基于共享知识库的随时间衰减记忆）
+        if self.memory and group_cfg.get("memory_enabled", False):
+            await self._inject_memory(event, req, user_id, str(group_id))
 
         if self.config.get("enable_debug_log"):
             logger.debug(
                 f"[IsolatedSession] user={user_id} group={group_id} "
                 f"cid={user_conv.cid} contexts={len(req.contexts)}"
             )
+
+    # ── 核心钩子：on_llm_response ───────────────────────────────
+
+    @filter.on_llm_response()
+    async def on_llm_response(
+        self, event: AstrMessageEvent, response: LLMResponse
+    ) -> None:
+        """LLM 回复后：按间隔抽取对话中的可记忆事实并写入记忆库。
+
+        抽取使用独立配置的 LLM 模型（memory_extract_provider_id），
+        并可把当前会话人设（on_llm_request 中捕获）提供给抽取模型。
+        """
+        if not self.memory:
+            if self.config.get("enable_debug_log"):
+                logger.debug(
+                    "[IsolatedSession] 记忆抽取跳过: 记忆系统未初始化"
+                    "（全局 memory_enabled 未开启，或共享知识库不可用）"
+                )
+            return
+        if not event.message_obj.group_id:
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        group_cfg = self._find_group_config(group_id, whitelist)
+        if not group_cfg or not group_cfg.get("memory_enabled", False):
+            if self.config.get("enable_debug_log"):
+                logger.debug(
+                    f"[IsolatedSession] 记忆抽取跳过: 群 {group_id} 未启用群级 memory_enabled"
+                )
+            return
+
+        user_id = event.get_sender_id()
+        owner = self._build_user_umo(event, user_id, group_id)
+        try:
+            if not await sp.session_get(owner, "memory_enabled", True):
+                if self.config.get("enable_debug_log"):
+                    logger.debug(
+                        f"[IsolatedSession] 记忆抽取跳过: 用户 {user_id} 已通过 /记忆开关 关闭"
+                    )
+                return
+
+            user_text = (event.message_str or "").strip()
+            reply_text = ((response.completion_text or "") if response else "").strip()
+            if not reply_text:
+                if self.config.get("enable_debug_log"):
+                    logger.debug(
+                        f"[IsolatedSession] 记忆抽取跳过: 本轮无助手回复（owner={owner}）"
+                    )
+                return
+
+            # 间隔控制：每 memory_extract_interval 轮抽取一次（0=每轮）。
+            # 触发时把间隔内积累的全部对话轮次一并交给抽取 LLM。
+            interval = max(0, int(self._mcfg("memory_extract_interval", 3) or 0))
+            if interval > 0:
+                buf = self._extract_buffers.setdefault(owner, [])
+                buf.append((user_text, reply_text))
+                count = int(await sp.session_get(owner, "memory_turn_count", 0) or 0)
+                count += 1
+                await sp.session_put(owner, "memory_turn_count", count)
+                if count % interval != 0:
+                    return
+                turns = list(buf)
+                buf.clear()
+            else:
+                turns = [(user_text, reply_text)]
+
+            logger.info(
+                f"[IsolatedSession] 触发记忆抽取: owner={owner}, 输入 {len(turns)} 轮对话, "
+                f"interval={interval}"
+            )
+            persona = event.get_extra("_isolated_memory_persona")
+            user_name = (event.get_sender_name() or "").strip()
+            task = asyncio.create_task(
+                self.memory.extract_memories(
+                    owner=owner,
+                    turns=turns,
+                    persona=persona,
+                    umo=event.unified_msg_origin,
+                    user_name=user_name,
+                )
+            )
+            self._track_task(task)
+        except Exception as e:
+            logger.warning(f"[IsolatedSession] 记忆抽取调度失败: {e}")
+
+    # ── 记忆注入 ────────────────────────────────────────────────
+
+    async def _inject_memory(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+        user_id: str,
+        group_id: str,
+    ) -> None:
+        """从共享记忆库召回衰减后的记忆并注入 LLM 请求。
+
+        全程容错：任何失败只跳过记忆注入，不阻塞对话。
+        """
+        try:
+            owner = self._build_user_umo(event, user_id, group_id)
+            if not await sp.session_get(owner, "memory_enabled", True):
+                return
+            if not req.prompt or not req.prompt.strip():
+                return
+
+            # 捕获当前会话人设，供 on_llm_response 抽取时使用
+            persona = await self._capture_persona(event, req)
+            if persona:
+                event.set_extra("_isolated_memory_persona", persona)
+
+            hits = await self.memory.recall(owner, req.prompt.strip())
+            if hits:
+                req.extra_user_content_parts.append(
+                    TextPart(text=self.memory.format_injection(hits)).mark_as_temp()
+                )
+                if self.config.get("enable_debug_log"):
+                    logger.debug(
+                        f"[IsolatedSession] 注入记忆 {len(hits)} 条: "
+                        + "; ".join(
+                            f"{h['text'][:16]}…({h['effective']:.4f})" for h in hits
+                        )
+                    )
+
+            # 惰性清扫（后台任务，避免阻塞请求）
+            self._schedule_task(self.memory.sweep(owner))
+        except Exception as e:
+            logger.warning(f"[IsolatedSession] 记忆注入失败: {e}")
+
+    async def _capture_persona(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> str | None:
+        """捕获当前会话生效的人设文本（供记忆抽取 LLM 参考）。
+
+        优先从隔离会话的 persona_id 获取结构化人设；
+        失败时回退提取 system_prompt 中的 "# Persona Instructions" 块。
+        """
+        try:
+            persona_id = getattr(req.conversation, "persona_id", None) or ""
+            if persona_id:
+                try:
+                    persona = await self.context.persona_manager.get_persona(persona_id)
+                    prompt = (persona.system_prompt or "").strip()
+                    if prompt:
+                        return prompt
+                except Exception:
+                    pass
+            sp_text = req.system_prompt or ""
+            match = re.search(
+                r"# Persona Instructions\n(.*?)(?=\n# |\Z)", sp_text, re.DOTALL
+            )
+            if match and match.group(1).strip():
+                return match.group(1).strip()
+        except Exception:
+            pass
+        return None
 
     # ── UMO 构造 ─────────────────────────────────────────────────
 
@@ -156,9 +346,7 @@ class Main(Star):
         self._conv_cache[cache_key] = new_cid
         self._last_active[new_cid] = time.time()
 
-        logger.info(
-            f"[IsolatedSession] 新建隔离会话: user={user_id} group={group_id}"
-        )
+        logger.info(f"[IsolatedSession] 新建隔离会话: user={user_id} group={group_id}")
         return conv
 
     # ── 存档管理 ─────────────────────────────────────────────────
@@ -218,7 +406,11 @@ class Main(Star):
                     )
                     if status == "ok":
                         recent_msgs = [msg for turn in recent for msg in turn]
-                        contexts = system_msgs + self._build_summary_pair(summary) + recent_msgs
+                        contexts = (
+                            system_msgs
+                            + self._build_summary_pair(summary)
+                            + recent_msgs
+                        )
                     elif status == "timeout":
                         # 压缩超时：回退为丢弃固定轮次，避免对话卡住
                         llm_timed_out = True
@@ -246,7 +438,9 @@ class Main(Star):
             if strategy == "llm_compress" and not llm_timed_out:
                 if self.config.get("enable_debug_log"):
                     logger.debug("[IsolatedSession] Token 超限，触发 LLM 上下文压缩")
-                contexts = await self._llm_compress(contexts, max_tokens, group_cfg, event)
+                contexts = await self._llm_compress(
+                    contexts, max_tokens, group_cfg, event
+                )
             elif strategy == "llm_compress":
                 # 本轮请求压缩已超时，避免再次等待 LLM，直接回退为丢弃固定轮次
                 logger.warning(
@@ -303,9 +497,7 @@ class Main(Star):
         strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
 
         if strategy == "llm_compress":
-            status, summary = await self._call_llm_summary(
-                old_msgs, group_cfg, event
-            )
+            status, summary = await self._call_llm_summary(old_msgs, group_cfg, event)
             if status == "ok":
                 return (
                     system_msgs + self._build_summary_pair(summary) + recent_msgs,
@@ -313,9 +505,7 @@ class Main(Star):
                 )
             if status == "timeout":
                 # 手动压缩超时：返回压缩失败，不修改上下文
-                logger.warning(
-                    "[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败"
-                )
+                logger.warning("[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败")
                 return contexts, "timeout"
             # LLM 压缩失败：返回压缩失败，不修改上下文
             logger.warning(
@@ -346,8 +536,7 @@ class Main(Star):
             group_cfg.get("llm_compress_instruction") or DEFAULT_COMPRESS_INSTRUCTION
         )
         compress_prompt = (
-            f"{instruction}\n\n"
-            f"Full conversation history to summarize:\n{old_text}"
+            f"{instruction}\n\nFull conversation history to summarize:\n{old_text}"
         )
 
         compress_provider_id = group_cfg.get("llm_compress_provider_id", "")
@@ -378,9 +567,7 @@ class Main(Star):
                 return "failed", None
             return "ok", summary
         except (asyncio.TimeoutError, TimeoutError):
-            logger.error(
-                f"[IsolatedSession] LLM 压缩请求超时（超过 {timeout} 秒）"
-            )
+            logger.error(f"[IsolatedSession] LLM 压缩请求超时（超过 {timeout} 秒）")
             return "timeout", None
         except Exception as e:
             logger.error(f"[IsolatedSession] LLM 压缩失败: {e}")
@@ -431,16 +618,10 @@ class Main(Star):
             return contexts
 
         old_msgs = [msg for turn in old_turns for msg in turn]
-        status, summary = await self._call_llm_summary(
-            old_msgs, group_cfg, event
-        )
+        status, summary = await self._call_llm_summary(old_msgs, group_cfg, event)
         if status == "timeout":
-            logger.warning(
-                "[IsolatedSession] LLM 压缩超时，回退为丢弃固定轮次"
-            )
-            return self._discard_old_turns(
-                contexts, self._get_dequeue_turns(group_cfg)
-            )
+            logger.warning("[IsolatedSession] LLM 压缩超时，回退为丢弃固定轮次")
+            return self._discard_old_turns(contexts, self._get_dequeue_turns(group_cfg))
         if status != "ok":
             logger.warning("[IsolatedSession] LLM 压缩失败，回退到轮次截断")
             return self._truncate_by_tokens_full(contexts, max_tokens)
@@ -477,9 +658,7 @@ class Main(Star):
                         continue
                     ptype = part.get("type", "")
                     if ptype == "text":
-                        total += self._estimate_text_tokens(
-                            part.get("text", "")
-                        )
+                        total += self._estimate_text_tokens(part.get("text", ""))
                     elif ptype == "image_url":
                         total += 765
                     elif ptype == "audio_url":
@@ -572,14 +751,43 @@ class Main(Star):
     # ── 辅助 ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _find_group_config(
-        group_id: str, whitelist: list[dict]
-    ) -> dict | None:
+    def _find_group_config(group_id: str, whitelist: list[dict]) -> dict | None:
         """在白名单中按 group_id 查找配置"""
         for item in whitelist:
             if str(item.get("group_id", "")) == group_id:
                 return item
         return None
+
+    def _mcfg(self, key: str, default):
+        """读取记忆配置：优先「memory」分组，兼容旧版扁平键。"""
+        try:
+            group = self.config.get("memory")
+            if isinstance(group, dict) and key in group:
+                return group.get(key, default)
+        except Exception:
+            pass
+        try:
+            return self.config.get(key, default)
+        except Exception:
+            return default
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        """登记后台任务引用并自动清理，防止任务被垃圾回收。"""
+
+        def _done(_: asyncio.Task) -> None:
+            self._pending_tasks.discard(task)
+            if not task.cancelled() and task.exception():
+                logger.error(f"[IsolatedSession] 后台任务异常: {task.exception()}")
+
+        task.add_done_callback(_done)
+        self._pending_tasks.add(task)
+
+    def _schedule_task(self, coro) -> None:
+        """调度一个后台协程（无事件循环时静默忽略）。"""
+        try:
+            self._track_task(asyncio.create_task(coro))
+        except RuntimeError:
+            pass
 
     # ── 用户命令 ─────────────────────────────────────────────────
 
@@ -603,9 +811,14 @@ class Main(Star):
         try:
             await conv_mgr.delete_conversations_by_user_id(user_umo)
             self._conv_cache.pop((group_id, user_id), None)
-            yield event.plain_result(
-                "✅ 已重置您在此群聊中的对话上下文。下次发言将创建新的独立会话。"
-            )
+            # 旧会话的待抽取缓冲随之丢弃，避免把重置前的对话抽成记忆
+            self._extract_buffers.pop(user_umo, None)
+            msg = "✅ 已重置您在此群聊中的对话上下文。下次发言将创建新的独立会话。"
+            # 可选：随会话重置一并清空记忆
+            if self._mcfg("memory_reset_with_session", False) and self.memory:
+                cleared = await self.memory.clear(user_umo)
+                msg += f"\n已同步清空记忆 {cleared} 条。"
+            yield event.plain_result(msg)
         except Exception as e:
             logger.error(f"[IsolatedSession] /会话重置 失败: {e}")
             yield event.plain_result(f"❌ 重置失败: {e}")
@@ -640,9 +853,11 @@ class Main(Star):
             contexts = json.loads(conv.history)
             ctx_count = len(contexts)
             est_tokens = self._count_tokens(contexts)
-            turn_count = len(self._group_into_turns(
-                [m for m in contexts if m.get("role") != "system"]
-            ))
+            turn_count = len(
+                self._group_into_turns(
+                    [m for m in contexts if m.get("role") != "system"]
+                )
+            )
 
         max_turns = group_cfg.get("max_turns", -1)
         max_tokens = group_cfg.get("max_tokens", 0)
@@ -934,9 +1149,7 @@ class Main(Star):
                 f"{len(history)} 条 | {self._count_tokens(history)} token | {time_str}"
             )
         lines.append("")
-        lines.append(
-            "使用 /读档 <存档名> 读档，/删档 <存档名> 删除存档"
-        )
+        lines.append("使用 /读档 <存档名> 读档，/删档 <存档名> 删除存档")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("删档", alias={"session_slot_delete"})
@@ -979,3 +1192,150 @@ class Main(Star):
             return
 
         yield event.plain_result(f"🗑 已删除存档「{slot_name}」。")
+
+    # ── 记忆系统命令 ────────────────────────────────────────────
+
+    @filter.command("记忆状态", alias={"memory_status"})
+    async def cmd_memory_status(self, event: AstrMessageEvent):
+        """查看当前用户在当前群聊中的记忆状态"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        if not self.memory:
+            yield event.plain_result(
+                "ℹ️ 记忆系统未启用。请在插件配置中启用 memory_enabled，"
+                "并在 memory_kb_name 中选择共享记忆知识库。"
+            )
+            return
+
+        user_id = event.get_sender_id()
+        owner = self._build_user_umo(event, user_id, group_id)
+        user_on = await sp.session_get(owner, "memory_enabled", True)
+        stats = await self.memory.stats(owner)
+        tokens = self._count_tokens(
+            [{"role": "user", "content": t} for t in stats.get("texts", [])]
+        )
+        half_life = float(self._mcfg("memory_half_life_days", 30) or 30)
+        ttl = float(self._mcfg("memory_ttl_days", 90) or 90)
+        top_k = int(self._mcfg("memory_inject_top_k", 3) or 3)
+
+        def fmt(ts):
+            return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "无"
+
+        lines = [
+            "【记忆状态】",
+            f"功能开关: {'开' if user_on else '关（/记忆开关 开）'}",
+            f"记忆条数: {stats.get('count', 0)}",
+            f"最早记忆: {fmt(stats.get('oldest'))}",
+            f"最近记忆: {fmt(stats.get('newest'))}",
+            f"估算Token: {tokens}",
+            f"衰减半衰期: {half_life} 天",
+            f"遗忘阈值(TTL): {ttl} 天",
+            f"每次注入: 最多 {top_k} 条",
+            "",
+            "使用 /记忆查询 <内容> 预览召回结果",
+            "使用 /记忆清除 清空当前记忆",
+            "使用 /记忆开关 开|关 切换",
+        ]
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("记忆清除", alias={"memory_clear"})
+    async def cmd_memory_clear(self, event: AstrMessageEvent):
+        """清空当前用户在当前群聊中的全部记忆"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        if not self.memory:
+            yield event.plain_result("ℹ️ 记忆系统未启用。")
+            return
+
+        user_id = event.get_sender_id()
+        owner = self._build_user_umo(event, user_id, group_id)
+        count = await self.memory.clear(owner)
+        yield event.plain_result(f"🗑 已清除 {count} 条记忆。")
+
+    @filter.command("记忆开关", alias={"memory_toggle"})
+    async def cmd_memory_toggle(self, event: AstrMessageEvent, state: str = ""):
+        """开启或关闭当前用户在当前群聊中的记忆功能"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        if not self.memory:
+            yield event.plain_result("ℹ️ 记忆系统未启用。")
+            return
+
+        user_id = event.get_sender_id()
+        owner = self._build_user_umo(event, user_id, group_id)
+        state = (state or "").strip().lower()
+        if state in ("开", "on", "true", "1", "启用"):
+            await sp.session_put(owner, "memory_enabled", True)
+            yield event.plain_result("✅ 已开启记忆功能。")
+        elif state in ("关", "off", "false", "0", "禁用"):
+            await sp.session_put(owner, "memory_enabled", False)
+            yield event.plain_result("✅ 已关闭记忆功能。")
+        else:
+            cur = await sp.session_get(owner, "memory_enabled", True)
+            yield event.plain_result(
+                f"ℹ️ 当前记忆功能: {'开' if cur else '关'}\n用法: /记忆开关 开|关"
+            )
+
+    @filter.command("记忆查询", alias={"memory_query"})
+    async def cmd_memory_query(self, event: AstrMessageEvent, query: str = ""):
+        """预览当前用户记忆的召回结果（含衰减后分数），用于调试衰减效果"""
+        if not event.message_obj.group_id:
+            yield event.plain_result("❌ 此命令仅在群聊中可用。")
+            return
+
+        group_id = str(event.message_obj.group_id)
+        whitelist = self.config.get("whitelist_groups", [])
+        if not self._find_group_config(group_id, whitelist):
+            yield event.plain_result("❌ 当前群聊未启用会话隔离。")
+            return
+
+        if not self.memory:
+            yield event.plain_result("ℹ️ 记忆系统未启用。")
+            return
+
+        query = (query or "").strip()
+        if not query:
+            yield event.plain_result("用法: /记忆查询 <内容>")
+            return
+
+        user_id = event.get_sender_id()
+        owner = self._build_user_umo(event, user_id, group_id)
+        hits = await self.memory.recall(owner, query)
+        if not hits:
+            yield event.plain_result("🔍 未召回相关记忆。")
+            return
+
+        lines = ["🔍 记忆召回结果（按衰减后分数排序）:"]
+        for i, hit in enumerate(hits, 1):
+            age = float(hit.get("age_days") or 0.0)
+            age_label = "今天" if age < 1 else f"{int(age)}天前"
+            lines.append(
+                f"{i}. {hit['text']}\n"
+                f"   相似度={hit.get('similarity', 0):.3f} "
+                f"衰减分={hit.get('effective', 0):.4f}（{age_label}）"
+            )
+        yield event.plain_result("\n".join(lines))

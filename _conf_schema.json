@@ -69,6 +69,12 @@
             "description": "LLM压缩提示词（可选，留空使用默认提示词）",
             "default": "",
             "hint": "仅 llm_compress 策略生效"
+          },
+          "memory_enabled": {
+            "type": "bool",
+            "description": "该群聊是否启用成员记忆（需在下方「记忆系统」分组开启总开关）",
+            "default": false,
+            "hint": "启用后，每位成员的对话会被抽取为长期记忆，并在后续对话中按时效衰减召回注入"
           }
         }
       }
@@ -79,5 +85,133 @@
     "type": "bool",
     "description": "是否启用调试日志",
     "default": false
+  },
+  "memory": {
+    "type": "object",
+    "description": "记忆系统（基于共享知识库的随时间衰减记忆）",
+    "hint": "记忆按 群×用户 隔离共存于所选共享知识库。相关度 × 时效衰减排序注入；被召回的会刷新时间戳（强化），超过遗忘阈值自动清扫删除。",
+    "items": {
+      "memory_enabled": {
+        "type": "bool",
+        "description": "记忆系统总开关",
+        "default": false,
+        "hint": "需先在 WebUI 创建知识库（配置 Embedding 模型），并在下方 memory_kb_name 中选择"
+      },
+      "memory_kb_name": {
+        "type": "list",
+        "items": {
+          "type": "string"
+        },
+        "description": "共享记忆知识库（单选）",
+        "default": [],
+        "_special": "select_knowledgebase",
+        "hint": "选择用户自建的一个知识库。所有用户的记忆以带 owner 元数据的 chunk 共存于该库，按 群×用户 隔离。请勿删除该库，否则记忆将丢失"
+      },
+      "memory_extract_interval": {
+        "type": "int",
+        "description": "每多少轮对话触发一次记忆提取",
+        "default": 3,
+        "obvious_hint": true,
+        "hint": "每 N 轮对话抽取一次记忆，避免每条消息都触发（消耗 LLM 调用）。触发时把间隔内积累的全部对话轮次一并交给提取 LLM。默认 3；0 = 每轮都抽取（不推荐）"
+      },
+      "memory_extract_provider_id": {
+        "type": "string",
+        "description": "记忆提取专用 LLM 模型（独立配置）",
+        "default": "",
+        "hint": "留空则使用当前会话的聊天模型进行提取。建议配置独立的快速模型；提取在后台异步执行，不阻塞对话回复",
+        "_special": "select_provider"
+      },
+      "memory_extract_timeout": {
+        "type": "int",
+        "description": "记忆提取请求超时时间（秒），0=不限制",
+        "default": 30,
+        "hint": "提取在后台执行，超时仅跳过本轮提取，不影响对话"
+      },
+      "memory_extract_include_persona": {
+        "type": "bool",
+        "description": "将当前人设（Persona）提供给记忆提取 LLM",
+        "default": true,
+        "hint": "开启后，提取提示词会附上当前会话生效的人设文本，使提取的记忆与人设对齐"
+      },
+      "memory_extract_use_names": {
+        "type": "bool",
+        "description": "提取提示词中使用用户昵称和机器人名（替代「用户/助手」）",
+        "default": true,
+        "hint": "开启后，抽取提示词用消息发送者的昵称称呼用户；机器人名取下方 memory_extract_bot_name（留空用「助手」）。获取不到昵称时自动回退「用户」"
+      },
+      "memory_extract_bot_name": {
+        "type": "string",
+        "description": "提取提示词中机器人的称呼（留空用「助手」）",
+        "default": "",
+        "hint": "仅在 memory_extract_use_names 开启且能获取到用户昵称时生效"
+      },
+      "memory_extract_persona_max_chars": {
+        "type": "int",
+        "description": "注入提取提示词的人设文本最大字符数",
+        "default": 1000
+      },
+      "memory_half_life_days": {
+        "type": "float",
+        "description": "记忆衰减半衰期（天）",
+        "default": 30,
+        "hint": "effective = 相似度 × 0.5^(天数/半衰期)。半衰期越短，旧记忆衰减越快"
+      },
+      "memory_ttl_days": {
+        "type": "float",
+        "description": "记忆遗忘阈值 TTL（天），超过后被清扫删除",
+        "default": 90,
+        "hint": "超过该天数的记忆不再召回，并在惰性清扫时从知识库中删除"
+      },
+      "memory_inject_top_k": {
+        "type": "int",
+        "description": "每次请求注入的记忆条数",
+        "default": 3
+      },
+      "memory_min_score": {
+        "type": "float",
+        "description": "记忆注入的最低有效分数（0 表示不限制）",
+        "default": 0.0
+      },
+      "memory_inject_max_chars": {
+        "type": "int",
+        "description": "注入记忆文本总字符上限",
+        "default": 600
+      },
+      "memory_fetch_k": {
+        "type": "int",
+        "description": "记忆检索池大小（稠密/稀疏召回上限）",
+        "default": 200,
+        "hint": "实际池大小取 max(fetch_k, 每用户记忆上限+20)，保证 owner 过滤不漏召回"
+      },
+      "memory_dup_threshold": {
+        "type": "float",
+        "description": "记忆去重相似度阈值",
+        "default": 0.9,
+        "hint": "新记忆与现有记忆相似度 ≥ 阈值时，仅强化现有记忆（刷新时间戳）而不重复写入"
+      },
+      "memory_max_docs_per_user": {
+        "type": "int",
+        "description": "每用户记忆条数上限（超出按最近使用裁剪）",
+        "default": 200
+      },
+      "memory_sweep_interval_minutes": {
+        "type": "int",
+        "description": "记忆惰性清扫间隔（分钟）",
+        "default": 60,
+        "hint": "清扫删除超过 TTL 的记忆并按上限裁剪；0=每次请求都清扫"
+      },
+      "memory_consolidate_enabled": {
+        "type": "bool",
+        "description": "遗忘前巩固（可选）：过期记忆先由 LLM 折叠为长期摘要再删除",
+        "default": false,
+        "hint": "开启后清扫时会额外消耗一次 LLM 调用"
+      },
+      "memory_reset_with_session": {
+        "type": "bool",
+        "description": "会话重置时是否一并清空该用户记忆",
+        "default": false,
+        "hint": "默认关闭：长时记忆独立于对话上下文，/会话重置 不清记忆；可用 /记忆清除 显式清空"
+      }
+    }
   }
 }
