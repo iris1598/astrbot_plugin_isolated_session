@@ -17,6 +17,12 @@
             "description": "群聊备注名（可选）",
             "default": ""
           },
+          "disable_group_queue": {
+            "type": "bool",
+            "description": "不按群聊队列等待",
+            "default": false,
+            "hint": "开启后，该群的 LLM 会话锁按成员分别计算，不同成员可以并行请求；同一成员仍会串行等待"
+          },
           "max_turns": {
             "type": "int",
             "description": "每位成员对话最大保留轮数（-1=不限制）",

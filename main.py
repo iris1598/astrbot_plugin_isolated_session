@@ -96,6 +96,46 @@ class Main(Star):
                 logger.error(f"[IsolatedSession] 记忆系统初始化失败: {e}")
                 self.memory = None
 
+    @filter.on_waiting_llm_request(priority=1)
+    async def on_waiting_llm_request(self, event: AstrMessageEvent) -> None:
+        """为启用开关的群聊把 AstrBot 的 LLM 会话锁细分到用户。
+
+        AstrBot 默认按 ``event.unified_msg_origin`` 获取会话锁；在群聊中，
+        这个值通常只包含群号，因此同群成员会共用一把锁。此钩子在获取
+        会话锁之前执行，为锁使用稳定的群聊 + 用户会话 ID，让不同成员可以
+        并行请求 LLM，同时保留同一成员请求的串行保护。
+        """
+        group_id = event.message_obj.group_id
+        if not group_id:
+            return
+
+        group_cfg = self._find_group_config(
+            str(group_id), self.config.get("whitelist_groups", [])
+        )
+        if not group_cfg or not group_cfg.get("disable_group_queue", False):
+            return
+
+        user_id = str(event.get_sender_id() or "")
+        if not user_id:
+            return
+        queue_session_id = self._build_queue_session_id(str(group_id), user_id)
+        if event.get_extra("_astrbot_session_lock_id"):
+            return
+
+        queue_umo = (
+            f"{event.get_platform_name()}:{MessageType.GROUP_MESSAGE.value}:"
+            f"{queue_session_id}"
+        )
+        # 仅覆盖 AstrBot 获取 LLM 会话锁时使用的键，不修改事件本身的
+        # unified_msg_origin，确保旧版 isolated__... 会话和配置路由继续生效。
+        event.set_extra("_astrbot_session_lock_id", queue_umo)
+
+        if self.config.get("enable_debug_log"):
+            logger.debug(
+                f"[IsolatedSession] 群聊 LLM 锁改为按用户隔离: "
+                f"group={group_id} user={user_id} lock_id={queue_umo}"
+            )
+
     # ── 核心钩子：on_llm_request ─────────────────────────────────
 
     @filter.on_llm_request()
@@ -316,6 +356,10 @@ class Main(Star):
         platform = event.get_platform_name()
         msg_type = MessageType.GROUP_MESSAGE.value  # "GroupMessage"
         return f"{platform}:{msg_type}:isolated__{user_id}__{group_id}"
+
+    def _build_queue_session_id(self, group_id: str, user_id: str) -> str:
+        """构造用于 AstrBot LLM 会话锁的群聊 + 用户会话 ID。"""
+        return f"isolated_queue__{user_id}__{group_id}"
 
     def _build_archive_umo(
         self, event: AstrMessageEvent, user_id: str, group_id: str

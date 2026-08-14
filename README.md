@@ -6,6 +6,7 @@
 
 - **群聊白名单隔离**：白名单内的群聊，每个成员拥有完全独立的 LLM 对话上下文，互不干扰
 - **每群聊独立配置**：每个群聊可单独设置 `max_turns`、`max_tokens`、`dequeue_turns`
+- **按成员并行请求**：可按群开启 `disable_group_queue`，不同成员请求 LLM 时不再共用群聊会话锁；同一成员仍保持串行，且不改变原有会话数据
 - **两种压缩策略**：
   - `truncate_by_turns` — 轮次截断，超限时直接丢弃旧轮次
   - `llm_compress` — LLM 摘要压缩，超限时用 LLM 将旧历史压缩为摘要（可指定独立的压缩模型）
@@ -39,6 +40,7 @@ data/plugins/astrbot_plugin_isolated_session/
 |--------|------|--------|------|
 | `group_id` | string | - | 群聊纯数字 ID |
 | `group_name` | string | - | 备注名（可选） |
+| `disable_group_queue` | bool | false | 开启后不按群聊共用 LLM 会话锁等待，改为按成员分别等待；同一成员仍串行 |
 | `max_turns` | int | 50 | 最大保留轮次，-1=不限制 |
 | `max_tokens` | int | 0 | 最大 Token 数，0=不限制 |
 | `dequeue_turns` | int | 10 | 超限时每次丢弃的最少轮数；LLM 压缩超时回退时按此丢弃最旧轮次 |
@@ -155,7 +157,9 @@ data/plugins/astrbot_plugin_isolated_session/
 ```
 用户消息到达
   → WakingCheckStage（唤醒检查）
-  → ProcessStage → build_main_agent（按群聊 UMO 加载对话，注入人设与全局知识库）
+  → ProcessStage
+  → 【可选】按群 + 用户细分 LLM 会话锁，避免同群成员互相等待
+  → build_main_agent（按群聊 UMO 加载对话，注入人设与全局知识库）
   → 【插件 on_llm_request 钩子】
       1. 检测群聊是否在白名单
       2. 构造每用户 UMO（isolated__ 前缀）
@@ -178,6 +182,7 @@ data/plugins/astrbot_plugin_isolated_session/
 - **本插件的轮次/Token 限制在 AstrBot 全局限制之前生效**。如果全局 `max_context_length` 比群聊配置更严，会被全局值二次截断。建议将每群聊的 `max_turns` 设为 ≤ 全局值
 - **LLM 压缩会额外消耗一次 LLM 调用**，请合理设置触发阈值
 - **超时保护机制**：自动压缩（轮次/Token 超限触发）若 LLM 请求超过 `llm_compress_timeout` 秒未返回，将丢弃最旧的 `dequeue_turns` 轮并继续对话，不再等待；手动 `/会话压缩` 超时或 LLM 压缩失败则直接提示压缩失败且不改动历史。建议将超时时间设为低于正常回复超时，避免整个群的对话被卡住
+- **群聊并行请求**：`disable_group_queue` 只细分 AstrBot 的 LLM 会话锁，不修改事件的 `unified_msg_origin`，因此不会新建或切换原有 `isolated__...` 隔离会话；AstrBot 全局速率限制仍按核心流水线原有的 `event.session_id` 规则执行。开启后同一成员仍串行，避免隔离会话历史并发写入
 - **存档说明**：存档使用独立的 `isolated_archive__` 命名空间存储在 AstrBot 数据库中，不会出现在正常会话里；`/会话重置` 只清空当前对话，不影响已保存的存档
 - **记忆系统依赖**：记忆功能需要 AstrBot ≥ 4.5.0 且配置了 Embedding 模型；未配置或知识库不可用时记忆功能自动禁用，不影响其余功能。记忆抽取/巩固会额外消耗 LLM 调用，建议设置合理的 `memory_extract_interval` 与独立的 `memory_extract_provider_id`
 - **升级迁移提示**：本版本将记忆配置收纳到「记忆系统」分组。AstrBot 的配置完整性检查会**移除顶层旧的扁平 `memory_*` 键**并以默认值生成新分组（不迁移旧值）——若从旧版本升级后记忆参数回到默认值，请到「记忆系统」分组中重新配置；插件运行时仍会兼容读取顶层扁平键（双读兜底），仅作防御

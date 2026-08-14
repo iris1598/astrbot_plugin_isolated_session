@@ -1,6 +1,6 @@
 name: astrbot_plugin_isolated_session
 display_name: 隔离会话
-desc: 群聊会话隔离插件 — 指定群聊中每位成员的 LLM 对话上下文互相独立，支持每群聊独立配置轮次/Token限制与压缩策略；内置基于共享知识库的随时间衰减记忆系统
-version: v1.4.0
+desc: 群聊会话隔离插件 — 指定群聊中每位成员的 LLM 对话上下文互相独立，支持每群聊独立配置轮次/Token限制、压缩策略和按成员并行请求；内置基于共享知识库的随时间衰减记忆系统
+version: v1.5.1
 author: iris1598
 repo: "https://github.com/iris1598/astrbot_plugin_isolated_session"
