@@ -140,7 +140,7 @@ data/plugins/astrbot_plugin_isolated_session/
 
 - **知识库前置**：请勿删除 `memory_kb_name` 中选择的知识库，否则记忆全部丢失；插件不会自动创建或删除该库
 - **隔离与共存**：所有成员的记忆以带 `memory_owner` 元数据的 chunk 共存于同一库，按 群×用户 严格隔离；每个用户对应 WebUI 知识库里的一个 **`[记忆] 群×用户` 虚拟文档**，可点开逐条查看/删除记忆；在 WebUI 删除该文档 = 清空该用户全部记忆（与 `/记忆清除` 等价）。记忆 chunk 遵循 AstrBot 的文档元数据约定（`kb_doc_id`/`chunk_index`），WebUI 知识库检索可正常搜索到记忆内容
-- **独立抽取模型**：`memory_extract_provider_id` 可指定抽取专用模型（成本可控）；抽取每 `memory_extract_interval` 轮触发一次，触发时把间隔内积累的**全部对话轮次**一并交给抽取模型（而非只抽当轮），抽取的视角更完整
+- **独立抽取模型**：`memory_extract_provider_id` 可指定抽取专用模型（成本可控）；待抽取轮次按 **平台×群×用户×具体会话** 隔离并持久化，累计到 `memory_extract_interval` 后才将完整批次交给抽取模型。插件重载不会丢失待抽取内容；会话重置、读档或关闭个人记忆时会同步清空旧批次，避免跨会话混入
 - **稳定输出协议**：抽取提示词将目标、提取边界、规范化规则和输出格式分段声明，要求模型只返回 `{"memories":["..."]}`；无有效记忆时返回 `{"memories":[]}`。解析器同时兼容旧版字符串数组、对象数组、常见字段名、Markdown 代码块和项目符号列表，减少模型格式漂移造成的漏提取或误写入
 - **抽取不阻塞对话**：记忆抽取在 `on_llm_response` 钩子中作为**后台任务**执行，回复已生成后才启动，`asyncio.wait_for(memory_extract_timeout)` 超时（默认 30 秒）或失败只会记日志并跳过，**绝不会阻塞或拖慢当前对话**——可以放心使用响应较慢的抽取模型；阻塞当前请求的只有向量检索（不含 LLM 调用），且失败会被捕获跳过
 - **人设注入**：开启 `memory_extract_include_persona` 后，抽取提示词会附上当前会话人设文本（取自会话 persona_id 或 system_prompt 的 Persona Instructions 块），使抽取的记忆与人设对齐

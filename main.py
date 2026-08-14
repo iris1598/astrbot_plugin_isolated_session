@@ -48,8 +48,8 @@ class Main(Star):
         self.memory: MemoryManager | None = None
         # 后台任务引用集合，防止被垃圾回收
         self._pending_tasks: set = set()
-        # 待抽取对话缓冲: {owner: [(user_text, reply_text), ...]}（间隔内积累的全部轮次）
-        self._extract_buffers: dict[str, list[tuple[str, str]]] = {}
+        # 记忆抽取状态锁：同一用户的并发回复串行更新持久化缓冲。
+        self._extract_locks: dict[str, asyncio.Lock] = {}
 
     # ── 初始化 ──────────────────────────────────────────────────
 
@@ -125,6 +125,8 @@ class Main(Star):
         # 4. 替换 req.conversation 和 req.contexts
         req.conversation = user_conv
         req.contexts = json.loads(user_conv.history) if user_conv.history else []
+        # 响应钩子据此把待抽取轮次绑定到本次实际使用的隔离会话。
+        event.set_extra("_isolated_memory_conversation_id", str(user_conv.cid))
 
         # 5. 预截断 / 压缩上下文
         await self._pre_truncate_contexts(req, group_cfg, event)
@@ -189,20 +191,30 @@ class Main(Star):
                     )
                 return
 
-            # 间隔控制：每 memory_extract_interval 轮抽取一次（0=每轮）。
-            # 触发时把间隔内积累的全部对话轮次一并交给抽取 LLM。
+            # 间隔控制：持久化缓存按 owner + conversation_id 隔离。
+            # 直接以缓存长度判断触发，避免插件重载后出现“计数保留、对话丢失”。
             interval = max(0, int(self._mcfg("memory_extract_interval", 3) or 0))
             if interval > 0:
-                buf = self._extract_buffers.setdefault(owner, [])
-                buf.append((user_text, reply_text))
-                count = int(await sp.session_get(owner, "memory_turn_count", 0) or 0)
-                count += 1
-                await sp.session_put(owner, "memory_turn_count", count)
-                if count % interval != 0:
+                conversation_id = str(
+                    event.get_extra("_isolated_memory_conversation_id") or ""
+                )
+                if not conversation_id:
+                    conversation_id = str(
+                        await self.context.conversation_manager.get_curr_conversation_id(
+                            owner
+                        )
+                        or ""
+                    )
+                turns = await self._buffer_extract_turn(
+                    owner=owner,
+                    conversation_id=conversation_id,
+                    turn=(user_text, reply_text),
+                    interval=interval,
+                )
+                if not turns:
                     return
-                turns = list(buf)
-                buf.clear()
             else:
+                await self._clear_extract_state(owner)
                 turns = [(user_text, reply_text)]
 
             logger.info(
@@ -782,6 +794,66 @@ class Main(Star):
         task.add_done_callback(_done)
         self._pending_tasks.add(task)
 
+    async def _buffer_extract_turn(
+        self,
+        owner: str,
+        conversation_id: str,
+        turn: tuple[str, str],
+        interval: int,
+    ) -> list[tuple[str, str]]:
+        """持久化一轮待抽取对话，达到间隔时返回一个完整批次。"""
+        lock = self._extract_locks.setdefault(owner, asyncio.Lock())
+        async with lock:
+            raw_state = await sp.session_get(owner, "memory_extract_state", {})
+            state = raw_state if isinstance(raw_state, dict) else {}
+            if str(state.get("conversation_id") or "") != conversation_id:
+                state = {"conversation_id": conversation_id, "turns": []}
+
+            pending: list[tuple[str, str]] = []
+            raw_turns = state.get("turns", [])
+            if isinstance(raw_turns, list):
+                for item in raw_turns:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        pending.append((str(item[0] or ""), str(item[1] or "")))
+            pending.append(turn)
+
+            if len(pending) < interval:
+                await sp.session_put(
+                    owner,
+                    "memory_extract_state",
+                    {"conversation_id": conversation_id, "turns": pending},
+                )
+                return []
+
+            batch = pending[:interval]
+            remaining = pending[interval:]
+            if remaining:
+                await sp.session_put(
+                    owner,
+                    "memory_extract_state",
+                    {"conversation_id": conversation_id, "turns": remaining},
+                )
+            else:
+                await sp.session_remove(owner, "memory_extract_state")
+            # 清理旧版本遗留的独立计数，避免升级后产生歧义。
+            try:
+                await sp.session_remove(owner, "memory_turn_count")
+            except Exception as e:
+                logger.debug(f"[IsolatedSession] 清理旧记忆抽取计数失败: {e}")
+            return batch
+
+    async def _clear_extract_state(self, owner: str) -> None:
+        """清除某用户当前会话的待抽取轮次及旧版计数。"""
+        lock = self._extract_locks.setdefault(owner, asyncio.Lock())
+        async with lock:
+            for key in ("memory_extract_state", "memory_turn_count"):
+                try:
+                    await sp.session_remove(owner, key)
+                except Exception as e:
+                    logger.debug(
+                        f"[IsolatedSession] 清理记忆抽取状态失败({key}): {e}"
+                    )
+
     def _schedule_task(self, coro) -> None:
         """调度一个后台协程（无事件循环时静默忽略）。"""
         try:
@@ -811,8 +883,8 @@ class Main(Star):
         try:
             await conv_mgr.delete_conversations_by_user_id(user_umo)
             self._conv_cache.pop((group_id, user_id), None)
-            # 旧会话的待抽取缓冲随之丢弃，避免把重置前的对话抽成记忆
-            self._extract_buffers.pop(user_umo, None)
+            # 旧会话的待抽取缓冲随之丢弃，避免把重置前的对话抽成记忆。
+            await self._clear_extract_state(user_umo)
             msg = "✅ 已重置您在此群聊中的对话上下文。下次发言将创建新的独立会话。"
             # 可选：随会话重置一并清空记忆
             if self._mcfg("memory_reset_with_session", False) and self.memory:
@@ -1097,6 +1169,8 @@ class Main(Star):
                 conversation_id=cid,
                 history=archive_history,
             )
+            # 读档替换了当前上下文，不能继续拼接读档前的待抽取轮次。
+            await self._clear_extract_state(user_umo)
             # 更新内存缓存
             self._conv_cache[(group_id, user_id)] = cid
             self._last_active[cid] = time.time()
@@ -1293,6 +1367,7 @@ class Main(Star):
             yield event.plain_result("✅ 已开启记忆功能。")
         elif state in ("关", "off", "false", "0", "禁用"):
             await sp.session_put(owner, "memory_enabled", False)
+            await self._clear_extract_state(owner)
             yield event.plain_result("✅ 已关闭记忆功能。")
         else:
             cur = await sp.session_get(owner, "memory_enabled", True)
