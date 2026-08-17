@@ -9,6 +9,8 @@ import asyncio
 import json
 import re
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger, sp
 from astrbot.api.event import AstrMessageEvent, filter
@@ -17,6 +19,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.db.po import Conversation
 from astrbot.core.platform.message_type import MessageType
+from astrbot.core.utils.session_lock import session_lock_manager
 
 from .memory import MemoryManager
 
@@ -55,6 +58,34 @@ class Main(Star):
 
     async def initialize(self) -> None:
         """插件激活时检测 unique_session 冲突并加载配置"""
+        # AstrBot 4.27.3 的部分构建仍直接用 unified_msg_origin 获取锁，
+        # 不读取 waiting 钩子写入的 _astrbot_session_lock_id。代理锁入口可在
+        # 不修改事件 UMO 的情况下兼容这些构建，并且对新版核心保持透明。
+        override_attr = "_isolated_session_lock_override"
+        original_attr = "_isolated_session_original_acquire_lock"
+        if not hasattr(session_lock_manager, override_attr):
+            setattr(
+                session_lock_manager,
+                override_attr,
+                ContextVar(override_attr, default=None),
+            )
+        if not hasattr(session_lock_manager, original_attr):
+            original_acquire_lock = session_lock_manager.acquire_lock
+            setattr(session_lock_manager, original_attr, original_acquire_lock)
+
+            @asynccontextmanager
+            async def acquire_lock_with_override(session_id: str):
+                override_var = getattr(session_lock_manager, override_attr)
+                override_session_id = override_var.get()
+                if override_session_id:
+                    # The override is for the immediately following core lock only.
+                    override_var.set(None)
+                async with original_acquire_lock(override_session_id or session_id):
+                    yield
+
+            session_lock_manager.acquire_lock = acquire_lock_with_override
+            logger.info("[IsolatedSession] 已启用旧版 AstrBot 会话锁兼容层")
+
         try:
             global_cfg = self._get_context_config()
             if global_cfg:
@@ -129,6 +160,13 @@ class Main(Star):
         # 仅覆盖 AstrBot 获取 LLM 会话锁时使用的键，不修改事件本身的
         # unified_msg_origin，确保旧版 isolated__... 会话和配置路由继续生效。
         event.set_extra("_astrbot_session_lock_id", queue_umo)
+        override_var = getattr(
+            session_lock_manager,
+            "_isolated_session_lock_override",
+            None,
+        )
+        if override_var is not None:
+            override_var.set(queue_umo)
 
         if self.config.get("enable_debug_log"):
             logger.debug(
