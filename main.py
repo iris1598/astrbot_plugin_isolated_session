@@ -557,13 +557,16 @@ class Main(Star):
         event: AstrMessageEvent,
         keep_count: int = 5,
     ) -> tuple[list[dict], str]:
-        """手动压缩上下文：保留最近 keep_count 条非 system 消息，其余压缩或丢弃。
+        """手动压缩上下文：保留最近 keep_count 条非 system 消息，其余用 LLM 压缩。
+
+        无论自动压缩策略（compression_strategy）如何配置，手动压缩
+        始终使用 LLM 生成摘要，避免静默丢弃历史内容。
 
         keep_count=0 表示全部压缩，不保留任何非 system 消息；
         keep_count 大于等于非 system 消息总数时无可压缩内容，原样返回。
 
         返回 (压缩结果, 状态)，状态取值：
-        - "ok": 压缩成功（含 LLM 成功或轮次截断）
+        - "ok": 压缩成功（LLM 摘要成功）
         - "timeout": LLM 压缩超时，上下文未修改，由调用方报告压缩失败
         - "failed": LLM 压缩失败，上下文未修改，由调用方报告压缩失败
         """
@@ -588,27 +591,21 @@ class Main(Star):
             old_msgs = non_system
             recent_msgs = []
 
-        strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
-
-        if strategy == "llm_compress":
-            status, summary = await self._call_llm_summary(old_msgs, group_cfg, event)
-            if status == "ok":
-                return (
-                    system_msgs + self._build_summary_pair(summary) + recent_msgs,
-                    "ok",
-                )
-            if status == "timeout":
-                # 手动压缩超时：返回压缩失败，不修改上下文
-                logger.warning("[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败")
-                return contexts, "timeout"
-            # LLM 压缩失败：返回压缩失败，不修改上下文
-            logger.warning(
-                "[IsolatedSession] 手动 LLM 压缩失败，返回压缩失败，上下文未修改"
+        status, summary = await self._call_llm_summary(old_msgs, group_cfg, event)
+        if status == "ok":
+            return (
+                system_msgs + self._build_summary_pair(summary) + recent_msgs,
+                "ok",
             )
-            return contexts, "failed"
-
-        # truncate_by_turns：仅保留最近 keep_count 条消息
-        return system_msgs + recent_msgs, "ok"
+        if status == "timeout":
+            # 手动压缩超时：返回压缩失败，不修改上下文
+            logger.warning("[IsolatedSession] 手动 LLM 压缩超时，返回压缩失败")
+            return contexts, "timeout"
+        # LLM 压缩失败：返回压缩失败，不修改上下文
+        logger.warning(
+            "[IsolatedSession] 手动 LLM 压缩失败，返回压缩失败，上下文未修改"
+        )
+        return contexts, "failed"
 
     # ── LLM 摘要调用（提取公共逻辑）──────────────────────────────
 
@@ -1116,18 +1113,13 @@ class Main(Star):
 
         new_count = len(compressed)
         new_tokens = self._count_tokens(compressed)
-        strategy = group_cfg.get("compression_strategy", "truncate_by_turns")
-        strategy_label = {
-            "truncate_by_turns": "轮次截断",
-            "llm_compress": "LLM摘要压缩",
-        }.get(strategy, strategy)
         keep_desc = (
             f"保留最近 {keep_count} 条" if keep_count > 0 else "全部压缩（不保留消息）"
         )
 
         yield event.plain_result(
             f"✅ 手动压缩完成\n"
-            f"策略: {strategy_label}\n"
+            f"策略: LLM摘要压缩\n"
             f"{keep_desc}\n"
             f"消息: {original_count} → {new_count}\n"
             f"Token: {original_tokens} → {new_tokens}"
