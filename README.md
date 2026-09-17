@@ -63,6 +63,9 @@ on_llm_response：每 memory_extract_interval 轮把积累的对话交给抽取�
   memory_consolidate_enabled / memory_reset_with_session`）。
 - `memory_reset_with_session`（默认 false）：**开启后 `/会话重置` 会同步清空
   该成员在当前群的记忆**（即旧插件的重置-清记忆联动）。
+- `favorability_reset_eval_with_session`（默认 true）：**若安装了 `astrbot_plugin_favorability`，
+  `/会话重置` 时会同步清除当前人格对该成员的评价（恢复为初始「初次见面」）**，
+  严格区分各人格独立存储，且绝不动好感度数值、关系档位、禁言等其它任何数据。
 - `memory_mbti_*`：`/记忆测评` 的开关、生成方法（`anchor` 锚点比对 / `llm`）、
   锚点中性阈值、最少记忆条数、参与分析的字符上限，以及仅 `llm` 方法使用的
   专用模型、超时与自定义提示词。留空模型则用当前会话聊天模型。

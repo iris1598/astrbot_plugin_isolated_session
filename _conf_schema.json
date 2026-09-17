@@ -34,6 +34,12 @@
     "description": "是否启用调试日志",
     "default": false
   },
+  "favorability_reset_eval_with_session": {
+    "type": "bool",
+    "description": "/会话重置 时是否同步清除当前人格的好感度评价（需安装 astrbot_plugin_favorability）",
+    "default": true,
+    "hint": "若已安装 astrbot_plugin_favorability 插件，开启后在会话重置时将同步重置当前人格对该用户的评价（印象重置为初次见面），严格保留好感度数值、关系档位、禁言等其它所有数据。"
+  },
   "compress_provider_id": {
     "type": "string",
     "description": "/会话压缩 专用 LLM 模型（可选）",

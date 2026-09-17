@@ -46,6 +46,7 @@ THIRD_PARTY_RUNNER_KEYS = {
     "deerflow": DEERFLOW_THREAD_ID_KEY,
 }
 
+from . import favorability_bridge as FB
 from . import session_tools as T
 from .memory import MemoryManager
 
@@ -520,6 +521,25 @@ class Main(Star):
         ):
             cleared = await mem.clear(umo)
             msg += f"\n已同步清空记忆 {cleared} 条。"
+
+        # 8) 好感度联动（若安装了 astrbot_plugin_favorability 则同步清除该人格下的评价）
+        if self.config.get("favorability_reset_eval_with_session", True):
+            try:
+                fav_cleared, fav_persona = await FB.clear_favorability_eval(
+                    self.context, event
+                )
+                if fav_cleared:
+                    tag = (
+                        f"【{fav_persona}】"
+                        if fav_persona and fav_persona != "default"
+                        else ""
+                    )
+                    msg += f"\n已同步清除{tag}好感度评价。"
+            except Exception as e:
+                logger.warning(
+                    f"[IsolatedMemory] 会话重置同步清除好感度评价异常(已跳过): {e}"
+                )
+
         yield event.plain_result(msg)
 
     @filter.command("会话信息", alias={"session_info"})
