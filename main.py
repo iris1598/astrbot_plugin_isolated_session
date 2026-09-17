@@ -21,6 +21,7 @@ astrbot_plugin_isolated_memory - 随时间衰减记忆 + 会话指令（官方�
 """
 
 import asyncio
+import os
 import re
 import time
 
@@ -47,6 +48,7 @@ THIRD_PARTY_RUNNER_KEYS = {
 }
 
 from . import favorability_bridge as FB
+from . import mbti_render
 from . import session_tools as T
 from .memory import MemoryManager
 
@@ -799,7 +801,7 @@ class Main(Star):
             "/存档 <名称>  /读档 <名称>  /存档列表  /删档 <名称>",
             "—",
             "/记忆状态  /记忆查询 <内容>  /记忆开关 开|关  /记忆清除",
-            "/记忆测评             依据全部记忆做锚点比对生成 MBTI 报告（娱乐向·结果可复现）",
+            "xxti (或 /xxti)       依据全部记忆做锚点比对生成 MBTI 报告（免/触发）",
             "提示：存档即官方「同会话多对话」，WebUI 对话管理同样可见。",
         ]))
 
@@ -919,9 +921,11 @@ class Main(Star):
             )
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("记忆测评", alias={"memory_mbti", "mbti"})
-    async def cmd_memory_mbti(self, event: AstrMessageEvent):
-        """依据你在当前会话保存的全部记忆生成一份 MBTI 推测报告（娱乐向）"""
+    @filter.regex(
+        r"^(?:/|/|#)?\s*(?i:(?:xxti|记忆测评|mbti|memory_mbti))(?:\s+.*)?$"
+    )
+    async def cmd_memory_mbti(self, event: AstrMessageEvent, arg: str = ""):
+        """依据你在当前会话保存的全部记忆生成一份 MBTI 推测报告（娱乐向，支持免/直接发送 xxti）"""
         if await self._ensure_memory() is None:
             yield event.plain_result(self._system_off_message())
             return
@@ -967,4 +971,54 @@ class Main(Star):
                 f"❌ 生成失败：{reason}。请稍后重试，或检查记忆系统的知识库配置。"
             )
             return
+
+        # 提取参数（兼容正则匹配与指令调用传参）
+        arg = (arg or "").strip()
+        if not arg and hasattr(event, "get_message_str"):
+            msg_str = (event.get_message_str() or "").strip()
+            m = re.match(
+                r"^(?:/|/|#)?\s*(?i:(?:xxti|记忆测评|mbti|memory_mbti))(?:\s+(.*))?$",
+                msg_str,
+            )
+            if m and m.group(1):
+                arg = m.group(1).strip()
+
+        # 决定渲染形式（默认优先图片海报）
+        arg_mode = arg.lower()
+        render_mode = (
+            str(self._mcfg("memory_mbti_render_mode", "image") or "image")
+            .strip()
+            .lower()
+        )
+        if arg_mode in ("文本", "text", "txt"):
+            render_mode = "text"
+        elif arg_mode in ("图", "图片", "image", "pic"):
+            render_mode = "image"
+
+        if (
+            render_mode == "image"
+            and hasattr(event, "image_result")
+        ):
+            try:
+                user_name = (
+                    getattr(event, "sender_name", None)
+                    or getattr(getattr(event, "message_obj", None), "sender", None)
+                    and getattr(event.message_obj.sender, "nickname", None)
+                    or ""
+                )
+                img_path = mbti_render.render_mbti_poster_pillow(
+                    report, user_name=user_name
+                )
+                if img_path and os.path.exists(img_path):
+                    if hasattr(event, "stop_event"):
+                        event.stop_event()
+                    yield event.image_result(img_path)
+                    return
+            except Exception as e:
+                logger.warning(
+                    f"[IsolatedMemory] MBTI 测评 Pillow 图片渲染异常: {e}，回退至文本输出"
+                )
+
+        if hasattr(event, "stop_event"):
+            event.stop_event()
         yield event.plain_result(self.memory.format_mbti_report(report))

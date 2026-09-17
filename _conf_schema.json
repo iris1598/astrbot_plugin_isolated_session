@@ -186,9 +186,9 @@
       },
       "memory_mbti_enabled": {
         "type": "bool",
-        "description": "MBTI 测评报告功能（/记忆测评）",
+        "description": "MBTI 测评报告功能（/xxti /记忆测评）",
         "default": true,
-        "hint": "开启后成员可用 /记忆测评 依据自己已保存的全部记忆生成 MBTI 推测报告。报告只读记忆、不写回"
+        "hint": "开启后成员可用 /xxti 或 /记忆测评 依据自己已保存的全部记忆生成 MBTI 推测报告。报告只读记忆、不写回"
       },
       "memory_mbti_method": {
         "type": "string",
@@ -233,6 +233,13 @@
         "description": "MBTI 报告自定义提示词（仅 llm 方法）",
         "default": "",
         "hint": "只替换「任务」段落；防注入声明、分析维度与 JSON 输出协议始终保留，以免报告无法解析"
+      },
+      "memory_mbti_render_mode": {
+        "type": "string",
+        "description": "MBTI 报告呈现形式（图片海报 / 纯文本）",
+        "default": "image",
+        "options": ["image", "text"],
+        "hint": "image=基于 Pillow 原生渲染精美紧凑海报卡片（无需浏览器依赖，含八极雷达图+双极平衡图+可能人格+极简画像，不泄露记忆证据）；text=纯文本模式；图片渲染失败时自动回退为纯文本"
       }
     }
   }
