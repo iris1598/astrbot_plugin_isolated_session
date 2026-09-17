@@ -1,189 +1,142 @@
-# 隔离会话 (Isolated Session)
+# 衰减记忆与会话工具
 
-为 AstrBot 提供**群聊级别的成员独立对话上下文**，支持每群聊配置独立的轮次限制、最大 Token 数及压缩策略；内置**基于共享知识库的随时间衰减记忆系统**。
+**一个插件补齐 astrbot_plugin_isolated_session 停用后的全部用户侧能力**：
+随时间衰减的长期记忆系统 + 中文会话管理指令。
+后端不再使用 `isolated__` 私有命名空间，全部直接对接
+AstrBot 官方对话体系（`ConversationManager`）与
+官方「平台设置 → 会话隔离（unique_session）」。
 
-## 功能
+数据格式与旧插件 v1.5.x 完全兼容；旧会话与记忆可通过
+**astrbot_plugin_isolated_session_export** 一键迁移。
 
-- **群聊白名单隔离**：白名单内的群聊，每个成员拥有完全独立的 LLM 对话上下文，互不干扰
-- **每群聊独立配置**：每个群聊可单独设置 `max_turns`、`max_tokens`、`dequeue_turns`
-- **按成员并行请求**：可按群开启 `disable_group_queue`，不同成员请求 LLM 时不再共用群聊会话锁；同一成员仍保持串行，且不改变原有会话数据
-- **两种压缩策略**：
-  - `truncate_by_turns` — 轮次截断，超限时直接丢弃旧轮次
-  - `llm_compress` — LLM 摘要压缩，超限时用 LLM 将旧历史压缩为摘要（可指定独立的压缩模型）
-- **自动回退**：自动压缩时 LLM 压缩失败会自动降级为轮次截断，不丢上下文
-- **超时/失败保护**：LLM 压缩请求超过 `llm_compress_timeout` 秒未返回时，自动压缩回退为丢弃固定轮次（`dequeue_turns`）；手动压缩超时或失败则直接提示压缩失败且不改动历史——避免压缩卡住或静默丢消息
-- **存档/读档**：每位成员可随时将当前隔离会话保存为命名存档，之后按名称读档恢复、查看或删除存档，存档持久化在 AstrBot 数据库中，重启不丢失
-- **独立命名空间**：隔离 UMO 使用 `isolated__` 前缀，与 AstrBot 原生 `unique_session` 不冲突
-- **随时间衰减的记忆系统**：复用用户自建自选的**单个共享知识库**，每位成员的对话自动抽取为长期记忆，后续对话按"相关度 × 时效衰减"召回注入；越久远的记忆影响力越低，超过 TTL 自动遗忘（清扫删除），被召回的记忆会被强化（刷新时间戳）
+## 会话隔离与 owner
 
-## 安装
+- 开启 `unique_session` 后群聊 UMO 为 `{平台ID}:GroupMessage:{用户}_{群}`，
+  记忆与会话指令天然**按群×成员独立**；未开启时对当前会话（如整群）生效。
+- `/记忆状态` 会显示当前会话归属(owner)，可直接核对隔离是否生效。
+- 官方隔离内置支持的平台：aiocqhttp、slack、dingtalk、qq_official、
+  qq_official_webhook、lark、misskey、matrix。
 
-将插件文件夹放入 AstrBot 的 `data/plugins/` 目录，在 WebUI 插件管理页启用即可。
+## 命令
+
+### 会话指令（官方后端）
+| 命令 | 说明 | 官方实现 |
+|------|------|----------|
+| `/会话重置`（session_reset） | 清空当前对话上下文，**存档不受影响** | 与官方 `/reset` 同语义：`update_conversation(umo, cid, [])` 就地清空 + 停止该会话运行中的 Agent + 权限场景（群聊未开隔离需管理员，alter_cmd 可覆盖）+ 第三方 runner 状态清理；同步丢弃待抽取缓冲；可联动清记忆 |
+| `/会话信息`（session_info） | 轮次/消息/估算Token/官方轮次上限与超限策略/存档数 | 当前对话 + `get_config(umo)` |
+| `/会话压缩 [保留条数]`（session_compress） | LLM 摘要压缩旧上下文，默认保留最近 5 条，0=全部 | `update_conversation`；超时/失败不改动内容 |
+| `/存档 <名称>`（session_save） | 上下文快照为命名存档，同名覆盖 | 官方多对话：`new_conversation(content,title)` 后切回原对话 |
+| `/读档 <名称>`（session_load） | 载入存档替换当前上下文 | 写入当前对话；无活跃对话时自动补建 |
+| `/存档列表`（session_slots） / `/删档 <名称>`（session_slot_delete） | 管理存档 | 按标题过滤该 UMO 的带标题对话 |
+| `/会话工具`（session_tools） | 帮助 | - |
+
+> **存档 = 官方"同会话多对话"**：WebUI 对话管理同样可见可删；
+> 经导出插件迁移的旧存档（标题即存档名）会被这些命令直接识别。
+
+### 记忆命令
+| 命令 | 说明 |
+|------|------|
+| `/记忆状态`（memory_status） | 条数、时间、Token、衰减参数、owner |
+| `/记忆查询 <内容>`（memory_query） | 召回预览（相似度/衰减分/天数） |
+| `/记忆开关 开\|关`（memory_toggle） | 按成员开关 |
+| `/记忆清除`（memory_clear） | 清空当前群×成员的全部记忆 |
+| `/记忆测评`（memory_mbti） | 依据全部已保存记忆生成 MBTI 推测报告（娱乐向，只读不写） |
+
+## 记忆工作原理
 
 ```
-data/plugins/astrbot_plugin_isolated_session/
-├── main.py
-├── memory.py
-├── metadata.yaml
-├── _conf_schema.json
-├── requirements.txt
-└── README.md
+on_llm_request：捕获人设 → 混合检索(稠密+BM25+RRF, 按 memory_owner 过滤)
+  → 衰减打分 effective = 融合分 × 0.5^(天数/半衰期) → top_k 临时注入（不入历史）
+  → 被注入的记忆刷新时间戳（回忆强化）；惰性清扫（TTL 删除 + LRU 裁剪）
+on_llm_response：每 memory_extract_interval 轮把积累的对话交给抽取模型
+  → 去重（≥dup_threshold 只强化）→ 写入共享知识库（后台任务不阻塞回复）
 ```
 
 ## 配置
 
-在 WebUI 插件配置页中编辑。白名单使用 `template_list` 格式，支持动态增删群聊配置。**记忆相关配置集中在独立的「记忆系统」分组中**（WebUI 中显示为「记忆系统」折叠子分组），分组内所有键名以 `memory_` 开头。
+- `memory_groups`：启用记忆的群列表（group_id / group_name / memory_enabled）。
+  **为空时自动兼容读取旧插件的 `whitelist_groups` 结构**，配置可直接粘贴。
+- `memory` 分组：与旧插件「记忆系统」分组同名同义
+  （`memory_enabled / memory_kb_name / memory_extract_* / memory_half_life_days /
+  memory_ttl_days / memory_inject_* / memory_fetch_k / memory_dup_threshold /
+  memory_max_docs_per_user / memory_sweep_interval_minutes /
+  memory_consolidate_enabled / memory_reset_with_session`）。
+- `memory_reset_with_session`（默认 false）：**开启后 `/会话重置` 会同步清空
+  该成员在当前群的记忆**（即旧插件的重置-清记忆联动）。
+- `memory_mbti_*`：`/记忆测评` 的开关、生成方法（`anchor` 锚点比对 / `llm`）、
+  锚点中性阈值、最少记忆条数、参与分析的字符上限，以及仅 `llm` 方法使用的
+  专用模型、超时与自定义提示词。留空模型则用当前会话聊天模型。
+- `compress_provider_id / compress_timeout / compress_instruction`：
+  `/会话压缩` 的模型、超时与提示词。
+- `enable_debug_log`：调试日志。
 
-每群聊配置项：
+## MBTI 测评报告
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `group_id` | string | - | 群聊纯数字 ID |
-| `group_name` | string | - | 备注名（可选） |
-| `disable_group_queue` | bool | false | 开启后不按群聊共用 LLM 会话锁等待，改为按成员分别等待；同一成员仍串行 |
-| `max_turns` | int | 50 | 最大保留轮次，-1=不限制 |
-| `max_tokens` | int | 0 | 最大 Token 数，0=不限制 |
-| `dequeue_turns` | int | 10 | 超限时每次丢弃的最少轮数；LLM 压缩超时回退时按此丢弃最旧轮次 |
-| `compression_strategy` | string | `truncate_by_turns` | `truncate_by_turns` 或 `llm_compress` |
-| `llm_compress_provider_id` | string | 空 | LLM 压缩专用模型（留空使用当前对话模型） |
-| `llm_compress_timeout` | int | 30 | LLM 压缩请求超时时间（秒），0=不限制 |
-| `llm_compress_keep_recent_ratio` | float | 0.15 | LLM 压缩时保留最近上下文比例 (0.0-0.3) |
-| `llm_compress_instruction` | text | 空 | 自定义压缩提示词（留空使用默认） |
-| `memory_enabled` | bool | false | 该群聊是否启用成员记忆（需「记忆系统」分组中的全局 `memory_enabled` 开启） |
+`/记忆测评` 读取当前成员**在当前群已保存的全部记忆**，推测四维倾向
+（E/I、S/N、T/F、J/P），输出类型、置信度、各维度强度与依据、概述与局限。
 
-全局配置项（位于「记忆系统」分组中，除白名单外）：
+两种方法由 `memory_mbti_method` 选择：
 
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `memory_enabled` | bool | false | 记忆系统总开关 |
-| `memory_kb_name` | list | 空 | 共享记忆知识库（单选，WebUI 选择器） |
-| `memory_extract_provider_id` | string | 空 | 记忆抽取专用 LLM 模型（留空用当前聊天模型） |
-| `memory_extract_include_persona` | bool | true | 是否把当前人设提供给抽取 LLM |
-| `memory_extract_persona_max_chars` | int | 1000 | 注入抽取提示词的人设最大字符数 |
-| `memory_extract_use_names` | bool | true | 抽取提示词用用户昵称与机器人名替代「用户/助手」称呼 |
-| `memory_extract_bot_name` | string | 空 | 抽取提示词中机器人的称呼（留空用「助手」） |
-| `memory_half_life_days` | float | 30 | 记忆衰减半衰期（天） |
-| `memory_ttl_days` | float | 90 | 记忆遗忘阈值 TTL（天） |
-| `memory_inject_top_k` | int | 3 | 每次请求注入的记忆条数 |
-| `memory_min_score` | float | 0.0 | 注入最低有效分数 |
-| `memory_inject_max_chars` | int | 600 | 注入记忆文本总字符上限 |
-| `memory_fetch_k` | int | 200 | 记忆检索池大小 |
-| `memory_extract_interval` | int | 3 | **每多少轮对话触发一次记忆抽取**（默认 3；触发时把间隔内积累的全部对话轮次一并交给提取 LLM；0=每轮都抽取，不推荐） |
-| `memory_extract_timeout` | int | 30 | 抽取 LLM 请求超时（秒） |
-| `memory_dup_threshold` | float | 0.9 | 记忆去重相似度阈值 |
-| `memory_max_docs_per_user` | int | 200 | 每用户记忆条数上限（LRU 裁剪） |
-| `memory_sweep_interval_minutes` | int | 60 | 记忆惰性清扫间隔（分钟） |
-| `memory_consolidate_enabled` | bool | false | 遗忘前巩固：过期记忆先由 LLM 折叠为长期摘要再删除 |
-| `memory_reset_with_session` | bool | false | 会话重置时是否一并清空记忆 |
-
-## 命令
-
-| 命令 | 说明 |
+| 方法 | 说明 |
 |------|------|
-| `/会话信息`（`session_info`） | 查看当前群聊中你的隔离会话状态（轮次、Token 数、策略等） |
-| `/会话重置`（`session_reset`） | 重置你在当前群聊中的隔离会话上下文 |
-| `/会话压缩 [保留条数]`（`session_compress`） | 手动压缩当前隔离会话的上下文。始终使用 LLM 生成摘要压缩旧内容（不跟随配置的压缩策略），可选保留最近 N 条消息：不填默认保留 5 条，填 0 表示全部压缩；不受自动触发的轮次/Token 上限限制 |
-| `/存档 <名称>`（`session_save`） | 将当前隔离会话保存为命名存档（同名存档会被覆盖） |
-| `/读档 <名称>`（`session_load`） | 载入指定存档，替换当前隔离会话的上下文（当前对话将被覆盖，可先存档备份） |
-| `/存档列表`（`session_slots`） | 列出你的全部存档（名称、消息数、Token、更新时间） |
-| `/删档 <名称>`（`session_slot_delete`） | 删除指定存档 |
-| `/记忆状态`（`memory_status`） | 查看你的记忆状态（条数、最早/最近时间、估算 Token、衰减参数） |
-| `/记忆清除`（`memory_clear`） | 清空你在当前群聊中的全部记忆 |
-| `/记忆开关 [开\|关]`（`memory_toggle`） | 开启/关闭你的记忆功能 |
-| `/记忆查询 <内容>`（`memory_query`） | 预览当前记忆的召回结果（含相似度、衰减后分数），用于调试衰减效果 |
+| `anchor`（默认） | **不调用 LLM**。把记忆和每极的锚点句都做嵌入，逐条比余弦相似度：记忆更贴近哪一极就投给哪一极，差值过小的记为中性。结论是纯算术，**同一批记忆必定得到同一结果**，且每个维度都能追溯到具体记忆 |
+| `llm` | 把全部记忆交给大模型推测。表达更自然，但**每次结果会有波动**，且结论无法追溯到具体记忆 |
 
-> 以上中文名称是主命令名，括号内为兼容保留的英文别名。存档名称仅支持中英文、数字、下划线、短横线，长度 1-20 个字符。
-
-## 记忆系统（随时间衰减）
-
-基于 **AstrBot 知识库（RAG）** 的每位成员长时记忆，按 **群 × 用户** 隔离，共存于**用户自建自选的单个共享知识库**。
-
-### 启用步骤
-
-1. 在 AstrBot WebUI「知识库」页创建知识库并配置 **Embedding 模型**（需要 AstrBot ≥ 4.5.0）
-2. 在插件配置页「记忆系统」分组中开启全局 `memory_enabled`，并在 `memory_kb_name` 选择该知识库
-3. 在目标群聊的白名单配置中开启 `memory_enabled`
-
-### 工作原理
+### anchor 方法怎么算
 
 ```
-用户消息 → build_main_agent（人设注入 system_prompt）
-  → 【on_llm_request 钩子】
-      1. 替换为隔离会话 + 预截断/压缩（原有逻辑）
-      2. 捕获当前人设（Persona）存入事件
-      3. 记忆召回：query=用户消息 → 共享库按 owner 过滤的混合检索（稠密+BM25+RRF）
-         → 衰减打分（effective = 融合分 × 0.5^(天数/半衰期)）→ 注入 top_k 条
-         → 追加到 extra_user_content_parts（mark_as_temp，不写入对话历史）
-  → LLM 生成回复
-  → 【on_llm_response 钩子】
-      4. 每 memory_extract_interval 轮触发：把间隔内积累的全部对话轮次交给独立抽取模型（可含人设）抽取可记忆事实
-         → 去重（相似度 ≥ memory_dup_threshold 则强化现有记忆）→ 写入共享库
-      5. 惰性清扫：删除超过 TTL 的记忆；按每用户上限 LRU 裁剪
+每条记忆 → 与「E 极锚点 / I 极锚点」各取最高余弦相似度 → 差值 < 阈值 记为中性
+        → 否则按 差值 × 时效权重 投给更近的一极（权重 = 0.5^(天数/半衰期)，与召回一致）
+每个维度 → ratio = |两极得分差| / 总得分，strength = ratio × n/(n+4) × 100
 ```
 
-### 衰减模型
+- **证据量收缩**：`n/(n+4)` 让证据少时结论自动变保守——1 条记忆最多只能给到 20%，
+  19 条才能到 83%。这比"一条记忆就敢下结论"诚实。
+- **中性记忆不参与**：两极相似度差值低于 `memory_mbti_anchor_threshold` 的记忆
+  计为中性并排除，报告会写出有多少条真正体现了倾向。
+- **判不出的维度写 `?`**：证据不足或两极正好抵消时该维度标 `?`（如 `I??P`），
+  不会硬凑一个字母。
+- **阈值要按模型调**：余弦相似度的尺度因 embedding 模型而异。报告里几乎全是中性
+  就调低阈值，判定明显是噪声就调高。
 
-- **时间钟**：每条记忆的 `updated_at`（写入或**被召回强化**时刷新，模拟"回忆增强记忆痕迹"）
-- **半衰期衰减**：`effective = fused_score × 0.5 ** (age_days / memory_half_life_days)`（默认半衰期 30 天）
-- **遗忘（TTL）**：超过 `memory_ttl_days`（默认 90 天）的记忆不再召回，惰性清扫时从库中删除
-- **LRU 上限**：每用户最多 `memory_max_docs_per_user` 条（默认 200），超出裁剪最久未使用的记忆
-- **可选巩固**：`memory_consolidate_enabled` 开启时，过期记忆先由 LLM 折叠为一条"长期摘要"再删除
+### 公共行为
 
-### 记忆命令
+- **娱乐向**：记忆是抽取器写入的短事实（每条 ≤200 字符），样本小且偏"偏好/事实"，
+  报告是倾向统计而非心理测评，正文末尾固定附带声明。
+- **只读不写**：报告不会写回记忆库，避免结论被后续召回当成用户事实。
+- **owner 边界**：记忆按 `群×成员` 隔离，只有在存过记忆的那个群内可用；
+  条数少于 `memory_mbti_min_memories`（默认 8）时提示继续积累。
+- **长度控制**：按最近使用时间倒序截取 `memory_mbti_max_chars`（默认 3000）字符。
+- **图片渲染接口**：`build_mbti_report()` / `build_mbti_anchor_report()` 返回的都是
+  同一个结构化报告字典，`format_mbti_report()` 只负责纯文本渲染；将来接入图片卡片时，
+  新增一个消费该字典的格式化器并在命令里替换调用即可，无需改动打分与分析逻辑。
 
-| 命令 | 说明 |
-|------|------|
-| `/记忆状态` | 查看记忆条数、最早/最近记忆时间、估算 Token、当前衰减参数 |
-| `/记忆查询 <内容>` | 调试：展示该查询的召回结果（相似度、衰减后分数、记忆天数） |
-| `/记忆清除` | 清空你在当前群聊中的全部记忆 |
-| `/记忆开关 [开\|关]` | 按用户开关记忆（默认开） |
+## 启用步骤
 
-### 记忆系统注意事项
-
-- **知识库前置**：请勿删除 `memory_kb_name` 中选择的知识库，否则记忆全部丢失；插件不会自动创建或删除该库
-- **隔离与共存**：所有成员的记忆以带 `memory_owner` 元数据的 chunk 共存于同一库，按 群×用户 严格隔离；每个用户对应 WebUI 知识库里的一个 **`[记忆] 群×用户` 虚拟文档**，可点开逐条查看/删除记忆；在 WebUI 删除该文档 = 清空该用户全部记忆（与 `/记忆清除` 等价）。记忆 chunk 遵循 AstrBot 的文档元数据约定（`kb_doc_id`/`chunk_index`），WebUI 知识库检索可正常搜索到记忆内容
-- **独立抽取模型**：`memory_extract_provider_id` 可指定抽取专用模型（成本可控）；待抽取轮次按 **平台×群×用户×具体会话** 隔离并持久化，累计到 `memory_extract_interval` 后才将完整批次交给抽取模型。插件重载不会丢失待抽取内容；会话重置、读档或关闭个人记忆时会同步清空旧批次，避免跨会话混入
-- **稳定输出协议**：抽取提示词将目标、提取边界、规范化规则和输出格式分段声明，要求模型只返回 `{"memories":["..."]}`；无有效记忆时返回 `{"memories":[]}`。解析器同时兼容旧版字符串数组、对象数组、常见字段名、Markdown 代码块和项目符号列表，减少模型格式漂移造成的漏提取或误写入
-- **抽取不阻塞对话**：记忆抽取在 `on_llm_response` 钩子中作为**后台任务**执行，回复已生成后才启动，`asyncio.wait_for(memory_extract_timeout)` 超时（默认 30 秒）或失败只会记日志并跳过，**绝不会阻塞或拖慢当前对话**——可以放心使用响应较慢的抽取模型；阻塞当前请求的只有向量检索（不含 LLM 调用），且失败会被捕获跳过
-- **人设注入**：开启 `memory_extract_include_persona` 后，抽取提示词会附上当前会话人设文本（取自会话 persona_id 或 system_prompt 的 Persona Instructions 块），使抽取的记忆与人设对齐
-- **相对时间处理**：抽取提示词会附上当前日期，并要求把「今天/明天/下周」等相对时间换算为具体日期（如「明天穿长袖」→「计划 2026-08-15 穿长袖」）后再记录，避免几天后召回时读到已过期的「明天」；明确的一次性临时安排（如「明天去买菜」）默认不记录为长期记忆
-- **称呼替换**：开启 `memory_extract_use_names`（默认开）后，抽取提示词用消息发送者的昵称称呼用户、用 `memory_extract_bot_name`（留空用「助手」）称呼机器人，替代冰冷的「用户/助手」标签；获取不到昵称时自动回退「用户」。注意：抽取出的记忆可能因此直接带上昵称（如「小明喜欢喝冰美式」）
-- **与全局知识库并存**：本插件记忆注入与 AstrBot 全局知识库检索各自注入独立的临时内容块，互不覆盖；注入的记忆不写入对话历史。注意：记忆 chunk 与普通文档共存于同一知识库，若同时启用 AstrBot 全局知识库检索（`kb_names` 选择该库），检索结果会包含记忆内容——如不希望如此，请勿在全局知识库设置中勾选启用
-- **升级提示（旧记忆数据）**：旧版本写入的记忆 chunk 缺少 `kb_doc_id`/`chunk_index` 元数据，会导致 WebUI 知识库检索报错。升级到本版本后请**先删除旧记忆数据**（在 WebUI 删除知识库重建，或用 `/记忆清除` 逐用户清空）再继续使用，新写入的记忆将自动附带完整元数据
-- **与 `/会话重置` 的关系**：默认**不**清空记忆（长时记忆独立于对话上下文）；如希望重置时一并清空，开启 `memory_reset_with_session`
-
-## 工作原理
-
-```
-用户消息到达
-  → WakingCheckStage（唤醒检查）
-  → ProcessStage
-  → 【可选】按群 + 用户细分 LLM 会话锁，避免同群成员互相等待
-  → build_main_agent（按群聊 UMO 加载对话，注入人设与全局知识库）
-  → 【插件 on_llm_request 钩子】
-      1. 检测群聊是否在白名单
-      2. 构造每用户 UMO（isolated__ 前缀）
-      3. 获取/创建用户的隔离对话
-      4. 替换 req.conversation → 后续 _save_to_history 自动写入隔离对话
-      5. 应用预截断/LLM 压缩
-      6. 【记忆】召回衰减后的相关记忆 → 追加为临时内容块（mark_as_temp）
-  → agent_runner.step()（LLM 生成回复）
-  → 【插件 on_llm_response 钩子】
-      7. 【记忆】按间隔把积累的全部对话轮次交给独立模型（可含人设）抽取可记忆事实 → 去重后写入共享知识库
-      8. 【记忆】惰性清扫（删除过期记忆、LRU 裁剪）
-  → 回复保存到用户的隔离对话
-```
-
-关键点：AstrBot 的 `_save_to_history` 使用 `req.conversation.cid` 保存历史，插件在钩子中替换 `req.conversation` 后，历史正确写入每用户的隔离对话。记忆注入使用 `extra_user_content_parts` + `mark_as_temp()`，不会进入对话历史。
+1. WebUI「平台设置」开启 **会话隔离（unique_session）**
+2. WebUI「知识库」创建知识库并配置 **Embedding 模型**
+3. 插件配置开启 `memory.memory_enabled` 并选择 `memory.memory_kb_name`
+4. `memory_groups` 添加需要记忆的群（或直接从旧插件粘贴 `whitelist_groups` 结构）
+5. 从旧插件迁移数据：先跑 astrbot_plugin_isolated_session_export 的
+   `/会话迁移` 流程，再停用旧插件、启用本插件
 
 ## 注意事项
 
-- **建议关闭 AstrBot 全局 `unique_session`**。两者同时开启不冲突（使用独立命名空间），但可能造成混淆
-- **本插件的轮次/Token 限制在 AstrBot 全局限制之前生效**。如果全局 `max_context_length` 比群聊配置更严，会被全局值二次截断。建议将每群聊的 `max_turns` 设为 ≤ 全局值
-- **LLM 压缩会额外消耗一次 LLM 调用**，请合理设置触发阈值
-- **超时保护机制**：自动压缩（轮次/Token 超限触发）若 LLM 请求超过 `llm_compress_timeout` 秒未返回，将丢弃最旧的 `dequeue_turns` 轮并继续对话，不再等待；手动 `/会话压缩` 超时或 LLM 压缩失败则直接提示压缩失败且不改动历史。建议将超时时间设为低于正常回复超时，避免整个群的对话被卡住
-- **群聊并行请求**：`disable_group_queue` 只细分 AstrBot 的 LLM 会话锁，不修改事件的 `unified_msg_origin`，因此不会新建或切换原有 `isolated__...` 隔离会话；AstrBot 全局速率限制仍按核心流水线原有的 `event.session_id` 规则执行。开启后同一成员仍串行，避免隔离会话历史并发写入
-- **存档说明**：存档使用独立的 `isolated_archive__` 命名空间存储在 AstrBot 数据库中，不会出现在正常会话里；`/会话重置` 只清空当前对话，不影响已保存的存档
-- **记忆系统依赖**：记忆功能需要 AstrBot ≥ 4.5.0 且配置了 Embedding 模型；未配置或知识库不可用时记忆功能自动禁用，不影响其余功能。记忆抽取/巩固会额外消耗 LLM 调用，建议设置合理的 `memory_extract_interval` 与独立的 `memory_extract_provider_id`
-- **升级迁移提示**：本版本将记忆配置收纳到「记忆系统」分组。AstrBot 的配置完整性检查会**移除顶层旧的扁平 `memory_*` 键**并以默认值生成新分组（不迁移旧值）——若从旧版本升级后记忆参数回到默认值，请到「记忆系统」分组中重新配置；插件运行时仍会兼容读取顶层扁平键（双读兜底），仅作防御
-- **插件重载后内存缓存丢失**，但隔离对话数据持久化在数据库中，不影响使用
+- **配置即改即生效**：初始化失败会在收消息/命令时按 15 秒节流自动重试，
+  WebUI 修改配置后无需重启。
+- **报错有精确原因**：全局开关 / 知识库不可用（含库名）/ 群不在启用列表
+  （列出当前已启用的群）/ 群开关关闭，分别提示。
+- **知识库前置**：勿删除 `memory_kb_name` 选择的库；WebUI 删除 `[记忆] xx`
+  虚拟文档 = 清空该成员记忆。
+- 与旧 astrbot_plugin_isolated_session **勿同时启用**（指令重名）。
+- 每群差异化的自动轮次/Token 上限由官方 provider_settings 管理
+  （WebUI 支持按会话覆盖），本插件只提供手动指令。
+
+## 测试
+
+```bash
+# 纯逻辑（任意 Python）
+python -m unittest discover -s astrbot_plugin_isolated_memory/tests -p "test_tools.py"
+# 完整（AstrBot 自带 Python）
+AstrBot\backend\python\python.exe -m unittest discover -s astrbot_plugin_isolated_memory/tests
+```

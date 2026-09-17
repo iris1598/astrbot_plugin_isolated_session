@@ -1,7 +1,8 @@
 {
-  "whitelist_groups": {
+  "memory_groups": {
     "type": "template_list",
-    "description": "群聊隔离白名单。在此列表中的群聊，每位成员的对话上下文相互独立。建议关闭 AstrBot 全局 unique_session 设置。",
+    "description": "启用记忆的群聊列表。配合官方「会话隔离(unique_session)」时，每位成员的记忆相互独立。",
+    "hint": "需先在 WebUI 平台设置中开启 会话隔离(unique_session)，否则群聊内所有成员共享同一份记忆。本列表为空时自动兼容读取旧插件配置结构 whitelist_groups 中的 memory_enabled 字段",
     "templates": {
       "group_config": {
         "label": "群聊配置",
@@ -10,77 +11,18 @@
             "type": "string",
             "description": "群聊 ID",
             "default": "",
-            "hint": "填写群聊的纯数字ID"
+            "hint": "填写群聊 ID（官方会话隔离开启后即为群号/session ID 中的群部分）"
           },
           "group_name": {
             "type": "string",
             "description": "群聊备注名（可选）",
             "default": ""
           },
-          "disable_group_queue": {
-            "type": "bool",
-            "description": "不按群聊队列等待",
-            "default": false,
-            "hint": "开启后，该群的 LLM 会话锁按成员分别计算，不同成员可以并行请求；同一成员仍会串行等待"
-          },
-          "max_turns": {
-            "type": "int",
-            "description": "每位成员对话最大保留轮数（-1=不限制）",
-            "default": 50,
-            "hint": "相当于 AstrBot 的 max_context_length，一个对话轮次 = 1 user + 1 assistant"
-          },
-          "max_tokens": {
-            "type": "int",
-            "description": "每位成员对话最大 Token 数（0=不限制）",
-            "default": 0,
-            "hint": "0 表示不限制 Token 数。达到限制时将触发压缩策略"
-          },
-          "dequeue_turns": {
-            "type": "int",
-            "description": "超限/LLM压缩超时时一次丢弃的最少轮数",
-            "default": 10,
-            "hint": "相当于 AstrBot 的 dequeue_context_length。LLM 压缩超时回退时按此轮数丢弃最旧上下文"
-          },
-          "compression_strategy": {
-            "type": "string",
-            "description": "上下文超限时的处理策略",
-            "default": "truncate_by_turns",
-            "options": [
-              "truncate_by_turns",
-              "llm_compress"
-            ],
-            "hint": "truncate_by_turns = 轮次截断, llm_compress = LLM摘要压缩"
-          },
-          "llm_compress_keep_recent_ratio": {
-            "type": "float",
-            "description": "LLM压缩时保留最近上下文的比例",
-            "default": 0.15,
-            "hint": "范围 0.0-0.3，仅 llm_compress 策略生效。例如 0.15 表示保留最近 15% 的上下文作为精确历史"
-          },
-          "llm_compress_provider_id": {
-            "type": "string",
-            "description": "LLM 压缩专用模型（可选）",
-            "default": "",
-            "hint": "仅在 llm_compress 策略下生效。留空则使用当前群聊的对话模型进行压缩。填写 Provider 的完整 ID",
-            "_special": "select_provider"
-          },
-          "llm_compress_timeout": {
-            "type": "int",
-            "description": "LLM 压缩请求超时时间（秒），0=不限制",
-            "default": 30,
-            "hint": "仅 llm_compress 策略生效。自动压缩超时回退为丢弃固定轮次（dequeue_turns），避免对话卡住；手动压缩超时返回压缩失败。建议 10-60"
-          },
-          "llm_compress_instruction": {
-            "type": "text",
-            "description": "LLM压缩提示词（可选，留空使用默认提示词）",
-            "default": "",
-            "hint": "仅 llm_compress 策略生效"
-          },
           "memory_enabled": {
             "type": "bool",
-            "description": "该群聊是否启用成员记忆（需在下方「记忆系统」分组开启总开关）",
-            "default": false,
-            "hint": "启用后，每位成员的对话会被抽取为长期记忆，并在后续对话中按时效衰减召回注入"
+            "description": "该群聊是否启用成员记忆",
+            "default": true,
+            "hint": "关闭后该群所有成员不再召回与抽取；需全局 memory_enabled 开启"
           }
         }
       }
@@ -92,10 +34,28 @@
     "description": "是否启用调试日志",
     "default": false
   },
+  "compress_provider_id": {
+    "type": "string",
+    "description": "/会话压缩 专用 LLM 模型（可选）",
+    "default": "",
+    "hint": "留空则使用当前会话的聊天模型进行压缩。填写 Provider 的完整 ID",
+    "_special": "select_provider"
+  },
+  "compress_timeout": {
+    "type": "int",
+    "description": "/会话压缩 LLM 请求超时时间（秒），0=不限制",
+    "default": 30,
+    "hint": "超时将直接报告压缩失败且不修改上下文，建议 10-60"
+  },
+  "compress_instruction": {
+    "type": "text",
+    "description": "/会话压缩 自定义提示词（留空使用默认）",
+    "default": ""
+  },
   "memory": {
     "type": "object",
     "description": "记忆系统（基于共享知识库的随时间衰减记忆）",
-    "hint": "记忆按 群×用户 隔离共存于所选共享知识库。相关度 × 时效衰减排序注入；被召回的会刷新时间戳（强化），超过遗忘阈值自动清扫删除。",
+    "hint": "记忆按 会话归属 owner（官方会话隔离下即 群×用户）隔离共存于所选共享知识库。相关度 × 时效衰减排序注入；被召回的会刷新时间戳（强化），超过遗忘阈值自动清扫删除。",
     "items": {
       "memory_enabled": {
         "type": "bool",
@@ -111,7 +71,7 @@
         "description": "共享记忆知识库（单选）",
         "default": [],
         "_special": "select_knowledgebase",
-        "hint": "选择用户自建的一个知识库。所有用户的记忆以带 owner 元数据的 chunk 共存于该库，按 群×用户 隔离。请勿删除该库，否则记忆将丢失"
+        "hint": "选择用户自建的一个知识库。所有用户的记忆以带 owner 元数据的 chunk 共存于该库，按会话归属隔离。请勿删除该库，否则记忆将丢失"
       },
       "memory_extract_interval": {
         "type": "int",
@@ -214,9 +174,59 @@
       },
       "memory_reset_with_session": {
         "type": "bool",
-        "description": "会话重置时是否一并清空该用户记忆",
+        "description": "/会话重置 时是否一并清空该用户记忆",
         "default": false,
-        "hint": "默认关闭：长时记忆独立于对话上下文，/会话重置 不清记忆；可用 /记忆清除 显式清空"
+        "hint": "默认关闭：长时记忆独立于对话上下文；开启后重置会话会同步清除记忆（需该群在记忆启用列表中）"
+      },
+      "memory_mbti_enabled": {
+        "type": "bool",
+        "description": "MBTI 测评报告功能（/记忆测评）",
+        "default": true,
+        "hint": "开启后成员可用 /记忆测评 依据自己已保存的全部记忆生成 MBTI 推测报告。报告只读记忆、不写回"
+      },
+      "memory_mbti_method": {
+        "type": "string",
+        "description": "报告生成方法",
+        "default": "anchor",
+        "options": ["anchor", "llm"],
+        "hint": "anchor=嵌入锚点比对（默认）：用记忆向量与各极锚点句算余弦，纯算术，同一批记忆必定得到同一结果，且每个维度都能追溯到具体记忆；llm=交给大模型推测，表达自然但每次结果会有波动"
+      },
+      "memory_mbti_anchor_threshold": {
+        "type": "float",
+        "description": "锚点中性判定阈值（仅 anchor 方法）",
+        "default": 0.02,
+        "hint": "两极锚点相似度差值低于该值的记忆视为中性、不参与判定。不同 embedding 模型的相似度尺度不同：若报告里几乎全部记忆都被判为中性就调低，若判定明显是噪声就调高"
+      },
+      "memory_mbti_provider_id": {
+        "type": "string",
+        "description": "MBTI 报告专用 LLM 模型（仅 llm 方法）",
+        "default": "",
+        "hint": "留空则使用当前会话的聊天模型。填写 Provider 的完整 ID",
+        "_special": "select_provider"
+      },
+      "memory_mbti_timeout": {
+        "type": "int",
+        "description": "MBTI 报告请求超时时间（秒，仅 llm 方法），0=不限制",
+        "default": 60,
+        "hint": "报告输出较长，建议 30-120。超时按失败处理，不写回任何内容"
+      },
+      "memory_mbti_min_memories": {
+        "type": "int",
+        "description": "生成报告所需的最少记忆条数",
+        "default": 8,
+        "hint": "记忆过少时推测没有意义，低于该条数直接提示用户继续积累记忆"
+      },
+      "memory_mbti_max_chars": {
+        "type": "int",
+        "description": "参与报告的记忆文本字符上限",
+        "default": 3000,
+        "hint": "按最近使用时间倒序截取，超出部分不参与分析（下限 500）"
+      },
+      "memory_mbti_instruction": {
+        "type": "text",
+        "description": "MBTI 报告自定义提示词（仅 llm 方法）",
+        "default": "",
+        "hint": "只替换「任务」段落；防注入声明、分析维度与 JSON 输出协议始终保留，以免报告无法解析"
       }
     }
   }
